@@ -75,6 +75,10 @@ class Store:
                 name TEXT NOT NULL,
                 stream_key TEXT NOT NULL UNIQUE
             );
+            CREATE TABLE IF NOT EXISTS settings (
+                name TEXT PRIMARY KEY,
+                value TEXT
+            );
             CREATE TABLE IF NOT EXISTS uploads (
                 file TEXT PRIMARY KEY,
                 dj_name TEXT NOT NULL,
@@ -142,6 +146,20 @@ class Store:
                 "title = excluded.title, updated = excluded.updated",
                 {"file": file, **values},
             )
+
+    def get_setting(self, name: str):
+        row = self.db.execute("SELECT value FROM settings WHERE name = ?", (name,)).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, name: str, value):
+        with self.db:
+            if value is None:
+                self.db.execute("DELETE FROM settings WHERE name = ?", (name,))
+            else:
+                self.db.execute(
+                    "INSERT INTO settings (name, value) VALUES (?, ?) "
+                    "ON CONFLICT(name) DO UPDATE SET value = excluded.value", (name, str(value)),
+                )
 
     def uploads(self, statuses):
         marks = ",".join("?" * len(statuses))
@@ -366,6 +384,22 @@ async def _process_recording(flv: Path):
         f"✅ **{title}** is on YouTube ({dj['privacy']}):\nhttps://youtu.be/{video_id}\n"
         "It may take a few minutes for YouTube to finish processing HD.",
     )
+    await post_vod(dj, title, video_id)
+
+
+async def post_vod(dj, title: str, video_id: str):
+    """Announce a new upload in the VOD channel, if an admin set one with /vodchannel."""
+    channel_id = store.get_setting("vod_channel_id")
+    if not channel_id:
+        return
+    try:
+        channel = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+        await channel.send(
+            f"🎶 New set from <@{dj['discord_id']}>: **{title}**\nhttps://youtu.be/{video_id}",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException as e:
+        log.warning("Couldn't post VOD in channel %s: %s", channel_id, e)
 
 
 def refresh_busy():
@@ -753,6 +787,29 @@ async def update(interaction: discord.Interaction):
         f"Checking GitHub for updates (current version: `{current_version()}`). "
         f"This takes up to a minute, plus a few minutes if there's something to install.{busy} "
         "I'll DM you the result.", ephemeral=True,
+    )
+
+
+@bot.tree.command(description="Admin: post every uploaded set in a channel (leave empty to turn off)")
+@app_commands.describe(channel="Channel to post new VODs in. Leave empty to stop posting.")
+@app_commands.default_permissions(manage_guild=True)
+@owner_only()
+async def vodchannel(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+    if channel is None:
+        store.set_setting("vod_channel_id", None)
+        await interaction.response.send_message("Stopped posting VODs to a channel.", ephemeral=True)
+        return
+    perms = channel.permissions_for(channel.guild.me)
+    if not (perms.view_channel and perms.send_messages):
+        await interaction.response.send_message(
+            f"I can't post in {channel.mention}. Give me **View Channel** and **Send Messages** there first.",
+            ephemeral=True,
+        )
+        return
+    store.set_setting("vod_channel_id", channel.id)
+    await interaction.response.send_message(
+        f"Every uploaded set will now be posted in {channel.mention}. Run `/vodchannel` with no channel to turn it off.",
+        ephemeral=True,
     )
 
 
