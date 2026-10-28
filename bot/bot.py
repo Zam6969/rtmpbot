@@ -33,6 +33,8 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
 RTMP_PUBLIC_URL = os.environ.get("RTMP_PUBLIC_URL", "rtmp://YOUR.SERVER.IP/live")
 MIN_RECORDING_SECONDS = int(os.environ.get("MIN_RECORDING_SECONDS", "120"))
+# Discord user IDs allowed to use the admin commands (comma-separated in .env to add more).
+OWNER_IDS = {int(i) for i in os.environ.get("OWNER_IDS", "464865517354614805").split(",") if i.strip()}
 TITLE_WAIT_MINUTES = int(os.environ.get("TITLE_WAIT_MINUTES", "30"))
 
 CONFIG_DIR = Path("/config")
@@ -445,6 +447,23 @@ class Bot(discord.Client):
 
 bot = Bot()
 
+
+def owner_only():
+    return app_commands.check(lambda interaction: interaction.user.id in OWNER_IDS)
+
+
+@bot.tree.error
+async def on_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        msg = "Only the bot owner can use this command."
+    else:
+        log.error("Command /%s failed", interaction.command.name if interaction.command else "?", exc_info=error)
+        msg = "Something went wrong running that command."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
 PRIVACY_CHOICES = [
     app_commands.Choice(name="Public", value="public"),
     app_commands.Choice(name="Unlisted", value="unlisted"),
@@ -635,6 +654,7 @@ youtube_group = app_commands.Group(
 )
 
 
+@owner_only()
 @youtube_group.command(name="connect", description="Connect (or switch) the YouTube channel sets upload to")
 @app_commands.describe(new_client="Enter a new Google Client ID/secret instead of the saved one")
 async def youtube_connect(interaction: discord.Interaction, new_client: bool = False):
@@ -644,6 +664,7 @@ async def youtube_connect(interaction: discord.Interaction, new_client: bool = F
         await send_login_link(interaction)
 
 
+@owner_only()
 @youtube_group.command(name="status", description="Show which YouTube channel is connected")
 async def youtube_status(interaction: discord.Interaction):
     if not TOKEN_PATH.exists():
@@ -663,6 +684,7 @@ bot.tree.add_command(youtube_group)
 
 @bot.tree.command(description="Admin: show recent uploads and any that failed")
 @app_commands.default_permissions(manage_guild=True)
+@owner_only()
 async def uploads(interaction: discord.Interaction):
     rows = store.uploads(["awaiting_title", "queued", "uploading", "failed", "done"])[:15]
     if not rows:
@@ -677,6 +699,7 @@ async def uploads(interaction: discord.Interaction):
 
 @bot.tree.command(description="Admin: update the bot to the latest version from GitHub")
 @app_commands.default_permissions(manage_guild=True)
+@owner_only()
 async def update(interaction: discord.Interaction):
     UPDATE_REQUEST_PATH.write_text(str(interaction.user.id))
     busy = " Someone is live or uploading right now, so it will wait until they're done." if (
@@ -690,6 +713,7 @@ async def update(interaction: discord.Interaction):
 
 @bot.tree.command(description="Admin: retry uploading recordings still on the server")
 @app_commands.default_permissions(manage_guild=True)
+@owner_only()
 async def retryuploads(interaction: discord.Interaction):
     n = queue_leftovers()
     await interaction.response.send_message(f"Retrying {n} recording(s).", ephemeral=True)

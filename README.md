@@ -25,7 +25,7 @@ DJs need DMs from server members turned on, or the bot can't ask them for a titl
 | `/uploads` | admins | Shows recent uploads and any that failed. |
 | `/retryuploads` | admins | Retries recordings still on the server (for example, when YouTube quota ran out). |
 
-"Admins" means anyone with the **Manage Server** permission. All command replies are private: only the person who ran the command sees them.
+"Admins" means the bot owner: only the Discord user IDs in `OWNER_IDS` (default `464865517354614805`) can use these, and Discord only shows them to people with **Manage Server**. All command replies are private: only the person who ran the command sees them.
 
 ## Install
 
