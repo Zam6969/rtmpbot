@@ -88,6 +88,7 @@ class Store:
         # Columns added after the first version; add them to existing databases.
         self._add_column("djs", "timezone", "TEXT NOT NULL DEFAULT 'UTC'")
         self._add_column("djs", "privacy", "TEXT NOT NULL DEFAULT 'unlisted'")
+        self._add_column("djs", "channel_id", "INTEGER")  # where to post if their DMs are closed
         self._add_column("uploads", "discord_id", "INTEGER")
         self._add_column("uploads", "title", "TEXT")
 
@@ -111,6 +112,11 @@ class Store:
                 "timezone = excluded.timezone, privacy = excluded.privacy",
                 (discord_id, name, key, timezone, privacy),
             )
+
+    def set_channel(self, discord_id: int, channel_id: int | None):
+        if channel_id:
+            with self.db:
+                self.db.execute("UPDATE djs SET channel_id = ? WHERE discord_id = ?", (channel_id, discord_id))
 
     def upload(self, file: str):
         return self.db.execute("SELECT * FROM uploads WHERE file = ?", (file,)).fetchone()
@@ -201,10 +207,18 @@ class TitleModal(discord.ui.Modal, title="Custom video title"):
 
 
 class TitleView(discord.ui.View):
-    def __init__(self, default: str):
+    def __init__(self, default: str, dj_id: int):
         super().__init__(timeout=None)  # ask_for_title enforces the deadline itself
         self.default = default
+        self.dj_id = dj_id
         self.chosen: str | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # When posted in a channel (DMs closed), only the DJ whose set it is may pick the title.
+        if interaction.user.id != self.dj_id:
+            await interaction.response.send_message("This isn't your set.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Custom title", style=discord.ButtonStyle.primary)
     async def custom(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -231,10 +245,31 @@ async def dm(discord_id: int, content: str, view: discord.ui.View | None = None)
         return None
 
 
+async def notify(dj, content: str, view: discord.ui.View | None = None):
+    """DM a DJ, or post in the channel they last used the bot in if their DMs are closed."""
+    msg = await dm(dj["discord_id"], content, view)
+    if msg is not None or not dj["channel_id"]:
+        return msg
+    try:
+        channel = bot.get_channel(dj["channel_id"]) or await bot.fetch_channel(dj["channel_id"])
+        kwargs = {"allowed_mentions": discord.AllowedMentions(users=True)}
+        if view is not None:
+            kwargs["view"] = view
+        return await channel.send(
+            f"<@{dj['discord_id']}> {content}\n"
+            "-# I couldn't DM you, so I'm posting here. To get these privately, turn on "
+            "**Direct Messages** in this server's Privacy Settings.",
+            **kwargs,
+        )
+    except discord.HTTPException as e:
+        log.warning("Couldn't post for %s in channel %s either: %s", dj["discord_id"], dj["channel_id"], e)
+        return None
+
+
 async def ask_for_title(dj, default: str, minutes: float) -> str:
-    view = TitleView(default)
-    msg = await dm(
-        dj["discord_id"],
+    view = TitleView(default, dj["discord_id"])
+    msg = await notify(
+        dj,
         f"🎧 Your set ({minutes:.0f} min) finished recording and is ready to upload to YouTube.\n"
         f"Default title: **{default}**\n"
         f"Want a custom title? If you don't pick within {TITLE_WAIT_MINUTES:g} minutes, I'll use the default.",
@@ -316,7 +351,7 @@ async def _process_recording(flv: Path):
         except Exception as e:
             log.exception("Upload of %s failed; keeping it for /retryuploads", flv.name)
             store.set_upload(flv.name, dj, "failed", error=str(e)[:500])
-            await dm(dj["discord_id"], f"⚠️ Uploading **{title}** failed. It's saved and will be retried.")
+            await notify(dj, f"⚠️ Uploading **{title}** failed. It's saved and will be retried.")
             return
         finally:
             mp4.unlink(missing_ok=True)
@@ -326,8 +361,8 @@ async def _process_recording(flv: Path):
     flv.unlink(missing_ok=True)
     store.set_upload(flv.name, dj, "done", video_id=video_id)
     log.info("Uploaded %s as https://youtu.be/%s (%s)", flv.name, video_id, title)
-    await dm(
-        dj["discord_id"],
+    await notify(
+        dj,
         f"✅ **{title}** is on YouTube ({dj['privacy']}):\nhttps://youtu.be/{video_id}\n"
         "It may take a few minutes for YouTube to finish processing HD.",
     )
@@ -520,10 +555,18 @@ async def register(
     existing = store.dj_by_id(interaction.user.id)
     key = existing["stream_key"] if existing else new_key()
     store.save_dj(interaction.user.id, name, key, timezone, privacy.value)
+    store.set_channel(interaction.user.id, interaction.channel_id)
     await interaction.response.send_message(
         ("You're all set!\n\n" if not existing else "Updated!\n\n") + settings_message(store.dj_by_id(interaction.user.id)),
         ephemeral=True,
     )
+    # Check now that DMs work, so DJs find out before their first set.
+    if await dm(interaction.user.id, "👋 You're signed up! This is where I'll ask you for titles and send your YouTube links.") is None:
+        await interaction.followup.send(
+            "⚠️ I couldn't DM you. I'll post your title questions and YouTube links in this channel instead. "
+            "To get them privately, turn on **Direct Messages** in this server's Privacy Settings.",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(description="See or change your username, timezone or video privacy")
@@ -556,6 +599,7 @@ async def settings(
         timezone or dj["timezone"],
         privacy.value if privacy else dj["privacy"],
     )
+    store.set_channel(interaction.user.id, interaction.channel_id)
     await interaction.response.send_message(settings_message(store.dj_by_id(interaction.user.id)), ephemeral=True)
 
 
@@ -569,6 +613,7 @@ async def resetkey(interaction: discord.Interaction):
         await interaction.response.send_message("You're live right now. Reset your key after you finish.", ephemeral=True)
         return
     store.save_dj(interaction.user.id, dj["name"], new_key(), dj["timezone"], dj["privacy"])
+    store.set_channel(interaction.user.id, interaction.channel_id)
     await interaction.response.send_message(
         "New key made. The old one no longer works.\n\n" + settings_message(store.dj_by_id(interaction.user.id)),
         ephemeral=True,

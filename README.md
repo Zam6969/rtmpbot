@@ -10,7 +10,7 @@ The bot runs everything:
    30 minutes, it uses the default: **`@username on mm/dd/yyyy VRCHAT`**, dated in the DJ's own timezone.
 4. The bot uploads the set to YouTube, **DMs the DJ the link**, and deletes the recording from the server.
 
-DJs need DMs from server members turned on, or the bot can't ask them for a title. In that case it uploads with the default title.
+If a DJ's DMs are closed, the bot posts the title question and the link in the channel where they last used a bot command, mentioning them; only that DJ can press the buttons. `/register` sends a test DM and warns them if it can't reach them.
 
 ## Discord commands
 
