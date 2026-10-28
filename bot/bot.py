@@ -780,7 +780,7 @@ async def uploads(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_guild=True)
 @owner_only()
 async def update(interaction: discord.Interaction):
-    UPDATE_REQUEST_PATH.write_text(str(interaction.user.id))
+    UPDATE_REQUEST_PATH.write_text(f"{interaction.user.id}\n")
     busy = " Someone is live or uploading right now, so it will wait until they're done." if (
         live_keys or uploading) else ""
     await interaction.response.send_message(

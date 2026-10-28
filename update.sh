@@ -21,7 +21,8 @@ fi
 
 finish() {  # finish <message>
   rm -f "$RESULT"
-  { cat "$REQUEST" 2>/dev/null || echo; echo "$1"; } > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
+  # First line: the requesting admin's Discord ID (empty for scheduled checks). Rest: the message.
+  { echo "$(tr -dc '0-9' < "$REQUEST" 2>/dev/null)"; echo "$1"; } > "$RESULT.tmp" && mv -f "$RESULT.tmp" "$RESULT"
   rm -f "$REQUEST"
   echo "$(date -Is) $1" >> "$LOG"
 }
