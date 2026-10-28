@@ -22,6 +22,7 @@ If a DJ's DMs are closed, the bot posts the title question and the link in the c
 | `/youtube connect` | admins | Links the YouTube channel that sets upload to (see below). |
 | `/youtube status` | admins | Shows which YouTube channel is connected. |
 | `/update` | admins | Updates the bot from GitHub right away and DMs you the result. |
+| `/status` | admins | Shows who's live (and how much is recorded), pending titles, upload progress and the last uploads. |
 | `/vodchannel [channel]` | admins | Posts every uploaded set in that channel. Run it with no channel to turn it off. |
 | `/uploads` | admins | Shows recent uploads and any that failed. |
 | `/retryuploads` | admins | Retries recordings still on the server (for example, when YouTube quota ran out). |

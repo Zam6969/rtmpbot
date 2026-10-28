@@ -173,6 +173,9 @@ upload_lock = asyncio.Lock()  # one upload at a time keeps bandwidth and YouTube
 live_keys: set[str] = set()  # keys streaming right now; their files are still being written
 queued: set[str] = set()  # file names already being handled
 uploading = False  # True while a set is being sent to YouTube
+live_since: dict[str, dt.datetime] = {}  # stream key -> when that DJ went live
+# What /status shows about the upload in progress: dj, title, stage, size, fraction.
+current_upload: dict = {}
 
 
 def new_key() -> str:
@@ -364,8 +367,13 @@ async def _process_recording(flv: Path):
         store.set_upload(flv.name, dj, "uploading")
         mp4 = flv.with_suffix(".mp4")
         try:
+            current_upload.update(dj=dj["name"], title=title, stage="preparing", size=flv.stat().st_size, fraction=0.0)
             await asyncio.to_thread(remux_to_mp4, flv)
-            video_id = await asyncio.to_thread(upload_video, mp4, title, description, dj["privacy"], TOKEN_PATH)
+            current_upload.update(stage="uploading", size=mp4.stat().st_size)
+            video_id = await asyncio.to_thread(
+                upload_video, mp4, title, description, dj["privacy"], TOKEN_PATH,
+                lambda f: current_upload.update(fraction=f),
+            )
         except Exception as e:
             log.exception("Upload of %s failed; keeping it for /retryuploads", flv.name)
             store.set_upload(flv.name, dj, "failed", error=str(e)[:500])
@@ -374,6 +382,7 @@ async def _process_recording(flv: Path):
         finally:
             mp4.unlink(missing_ok=True)
             uploading = False
+            current_upload.clear()
             refresh_busy()
 
     flv.unlink(missing_ok=True)
@@ -456,6 +465,7 @@ async def on_publish(request: web.Request):
         log.info("Rejected stream with unknown key from %s", form.get("addr"))
         return web.Response(status=403)
     live_keys.add(key)
+    live_since[key] = dt.datetime.now(dt.timezone.utc)
     refresh_busy()
     log.info("%s started streaming", dj["name"])
     return web.Response(text="ok")
@@ -464,6 +474,7 @@ async def on_publish(request: web.Request):
 async def on_publish_done(request: web.Request):
     form = await request.post()
     live_keys.discard(form.get("name", ""))
+    live_since.pop(form.get("name", ""), None)
     refresh_busy()
     return web.Response(text="ok")
 
@@ -761,6 +772,58 @@ async def youtube_status(interaction: discord.Interaction):
 
 
 bot.tree.add_command(youtube_group)
+
+
+def gb(size: float) -> str:
+    return f"{size / 1e9:.2f} GB" if size >= 1e8 else f"{size / 1e6:.0f} MB"
+
+
+@bot.tree.command(description="Admin: see who's live, what's recording and upload progress")
+@app_commands.default_permissions(manage_guild=True)
+@owner_only()
+async def status(interaction: discord.Interaction):
+    now = dt.datetime.now(dt.timezone.utc)
+    lines = []
+
+    lines.append("**🔴 Live now**")
+    if not live_keys:
+        lines.append("Nobody is streaming to the server.")
+    for key in sorted(live_keys):
+        dj = store.dj_by_key(key)
+        files = sorted(RECORDINGS_DIR.glob(f"{key}-*.flv"), key=lambda f: f.stat().st_mtime)
+        size = f", recorded {gb(files[-1].stat().st_size)} so far" if files else ""
+        minutes = (now - live_since[key]).total_seconds() / 60 if key in live_since else 0
+        lines.append(f"• @{dj['name'] if dj else '?'}: live for {minutes:.0f} min{size}")
+
+    lines.append("\n**⬆️ Upload**")
+    if current_upload:
+        u = current_upload
+        if u["stage"] == "preparing":
+            lines.append(f"• @{u['dj']}: **{u['title']}**, preparing the file ({gb(u['size'])})")
+        else:
+            lines.append(f"• @{u['dj']}: **{u['title']}**, {u['fraction'] * 100:.0f}% of {gb(u['size'])} sent to YouTube")
+    else:
+        lines.append("Nothing uploading right now.")
+
+    waiting = store.uploads(["awaiting_title", "queued", "failed"])
+    if waiting:
+        lines.append("\n**⏳ Waiting**")
+        labels = {"awaiting_title": "waiting for the DJ to pick a title", "queued": "next in line to upload",
+                  "failed": "upload failed; will retry"}
+        for r in waiting[:10]:
+            lines.append(f"• @{r['dj_name']}: {labels[r['status']]}" + (f" ({r['title']})" if r["title"] else ""))
+
+    done = store.uploads(["done"])[:3]
+    if done:
+        lines.append("\n**✅ Last uploads**")
+        for r in done:
+            lines.append(f"• @{r['dj_name']}: [{r['title'] or 'video'}](https://youtu.be/{r['video_id']})")
+
+    lines.append(
+        f"\n-# YouTube: {'connected' if TOKEN_PATH.exists() else '**not connected** (/youtube connect)'}"
+        f" · version {current_version()}"
+    )
+    await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True, suppress_embeds=True)
 
 
 @bot.tree.command(description="Admin: show recent uploads and any that failed")

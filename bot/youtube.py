@@ -25,8 +25,11 @@ def _credentials(token_path: Path) -> Credentials:
     return creds
 
 
-def upload_video(path: Path, title: str, description: str, privacy: str, token_path: Path) -> str:
-    """Upload a video and return its YouTube ID. Blocking; run it in a thread."""
+def upload_video(path: Path, title: str, description: str, privacy: str, token_path: Path, on_progress=None) -> str:
+    """Upload a video and return its YouTube ID. Blocking; run it in a thread.
+
+    on_progress, if given, is called with the fraction uploaded (0.0-1.0) after each chunk.
+    """
     youtube = build("youtube", "v3", credentials=_credentials(token_path), cache_discovery=False)
     request = youtube.videos().insert(
         part="snippet,status",
@@ -38,7 +41,9 @@ def upload_video(path: Path, title: str, description: str, privacy: str, token_p
     )
     response = None
     while response is None:
-        _, response = request.next_chunk(num_retries=5)
+        status, response = request.next_chunk(num_retries=5)
+        if on_progress and status:
+            on_progress(status.progress())
     return response["id"]
 
 
