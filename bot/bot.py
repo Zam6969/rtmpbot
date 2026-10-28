@@ -418,8 +418,10 @@ async def housekeeping():
         if UPDATE_RESULT_PATH.exists():
             lines = UPDATE_RESULT_PATH.read_text().splitlines()
             UPDATE_RESULT_PATH.unlink(missing_ok=True)
-            requester = lines[0].strip() if lines else ""
-            message = "\n".join(lines[1:]).strip()
+            # First line is the admin's Discord ID; older update.sh versions put the message on the same line.
+            m = re.match(r"^(\d{15,20})?(.*)$", lines[0].strip() if lines else "")
+            requester = m[1] or ""
+            message = "\n".join([m[2]] + lines[1:]).strip()
             log.info("Update: %s", message)
             if requester.isdigit():
                 await dm(int(requester), f"🔄 {message}")
