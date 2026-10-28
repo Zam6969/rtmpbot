@@ -344,6 +344,11 @@ async def _process_recording(flv: Path):
         log.info("%s is only %.0fs; deleting without upload", flv.name, seconds)
         flv.unlink(missing_ok=True)
         store.set_upload(flv.name, dj, "skipped", error=f"too short ({seconds:.0f}s)")
+        await notify(
+            dj,
+            f"Your stream was only {seconds:.0f} seconds, so I didn't upload it. Sets need to be at least "
+            f"{MIN_RECORDING_SECONDS // 60} minutes{f' {MIN_RECORDING_SECONDS % 60} seconds' if MIN_RECORDING_SECONDS % 60 else ''} long.",
+        )
         return
 
     started_utc = dt.datetime.strptime(m["stamp"], "%Y%m%d-%H%M%S").replace(tzinfo=dt.timezone.utc)
