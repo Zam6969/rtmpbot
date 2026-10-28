@@ -65,8 +65,11 @@ The server checks this GitHub repository every 15 minutes and installs new versi
 The update log is in `config/update.log`.
 
 ## Good to know
-* **YouTube limits:** the free API quota allows about **6 uploads a day**. Uploads beyond that fail and stay on
-  the server. Run `/retryuploads` the next day.
+* **YouTube limits:** the free API quota allows about **6 uploads a day**, resetting at midnight Pacific time.
+  Once the day's uploads are used up (or YouTube reports the quota exhausted), further sets wait in a first-come,
+  first-served queue. Each DJ is told their place in line and when it will upload, and the queue uploads by itself
+  after the reset. `/status` shows the queue. Change the limit with `DAILY_UPLOAD_LIMIT` in `.env`
+  (for example after Google grants more quota).
 * **New Google projects can only upload private videos** until Google approves them. Request this with the
   "YouTube API Services audit" form (free). Until then every set uploads as private, whatever the DJ picked.
 * The default title format is set in `default_title()` in `bot/bot.py`, and the wait time in `TITLE_WAIT_MINUTES` in `.env`.

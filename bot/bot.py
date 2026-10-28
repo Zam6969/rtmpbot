@@ -36,6 +36,10 @@ MIN_RECORDING_SECONDS = int(os.environ.get("MIN_RECORDING_SECONDS", "120"))
 # Discord user IDs allowed to use the admin commands (comma-separated in .env to add more).
 OWNER_IDS = {int(i) for i in os.environ.get("OWNER_IDS", "464865517354614805").split(",") if i.strip()}
 TITLE_WAIT_MINUTES = int(os.environ.get("TITLE_WAIT_MINUTES", "30"))
+# YouTube's free API quota allows about 6 uploads a day; it resets at midnight Pacific time.
+DAILY_UPLOAD_LIMIT = int(os.environ.get("DAILY_UPLOAD_LIMIT", "6"))
+QUOTA_TZ = ZoneInfo("America/Los_Angeles")
+QUOTA_RESET_GRACE = 60  # seconds to wait past the reset before trying again
 
 CONFIG_DIR = Path("/config")
 RECORDINGS_DIR = Path("/recordings")
@@ -176,6 +180,7 @@ uploading = False  # True while a set is being sent to YouTube
 live_since: dict[str, dt.datetime] = {}  # stream key -> when that DJ went live
 # What /status shows about the upload in progress: dj, title, stage, size, fraction.
 current_upload: dict = {}
+upload_queue: list[str] = []  # file names waiting for (or holding) upload_lock, in upload order
 
 
 def new_key() -> str:
@@ -311,6 +316,48 @@ async def ask_for_title(dj, default: str, minutes: float) -> str:
 
 # ---- Recording pipeline ---------------------------------------------------------
 
+def utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def next_quota_reset(now: dt.datetime | None = None) -> dt.datetime:
+    today = (now or utcnow()).astimezone(QUOTA_TZ).date()
+    return dt.datetime.combine(today + dt.timedelta(days=1), dt.time(0), tzinfo=QUOTA_TZ)
+
+
+def uploads_today() -> int:
+    day_start = next_quota_reset() - dt.timedelta(days=1)
+    return sum(
+        1 for r in store.uploads(["done"])
+        if dt.datetime.fromisoformat(r["updated"]) >= day_start
+    )
+
+
+def quota_wait_until() -> dt.datetime | None:
+    """When uploads can resume, or None if one can start now."""
+    blocked = store.get_setting("quota_blocked_until")
+    if blocked and dt.datetime.fromisoformat(blocked) > utcnow():
+        return dt.datetime.fromisoformat(blocked)
+    if uploads_today() >= DAILY_UPLOAD_LIMIT:
+        return next_quota_reset()
+    return None
+
+
+def is_quota_error(e: Exception) -> bool:
+    content = getattr(e, "content", b"") or b""
+    if isinstance(content, str):
+        content = content.encode()
+    return any(reason in content for reason in (b"quotaExceeded", b"uploadLimitExceeded", b"dailyLimitExceeded"))
+
+
+def when_for(dj, moment: dt.datetime) -> str:
+    try:
+        local = moment.astimezone(ZoneInfo(dj["timezone"]))
+    except Exception:
+        local = moment
+    return f"{local:%I:%M %p %Z} on {local:%m/%d}".lstrip("0")
+
+
 def queue_recording(flv: Path):
     if flv.name not in queued:
         queued.add(flv.name)
@@ -366,29 +413,58 @@ async def _process_recording(flv: Path):
     description = f"Live set by @{dj['name']}, recorded {started:%m/%d/%Y %I:%M %p %Z}."
 
     global uploading
-    async with upload_lock:
-        uploading = True
-        refresh_busy()
-        store.set_upload(flv.name, dj, "uploading")
-        mp4 = flv.with_suffix(".mp4")
-        try:
-            current_upload.update(dj=dj["name"], title=title, stage="preparing", size=flv.stat().st_size, fraction=0.0)
-            await asyncio.to_thread(remux_to_mp4, flv)
-            current_upload.update(stage="uploading", size=mp4.stat().st_size)
-            video_id = await asyncio.to_thread(
-                upload_video, mp4, title, description, dj["privacy"], TOKEN_PATH,
-                lambda f: current_upload.update(fraction=f),
+    upload_queue.append(flv.name)
+    try:
+        # Tell the DJ up front if YouTube's daily limit means their set has to wait.
+        until = quota_wait_until()
+        if until and (store.upload(flv.name)["status"] != "waiting_quota"):
+            store.set_upload(flv.name, dj, "waiting_quota")
+            await notify(
+                dj,
+                f"⏳ YouTube only allows {DAILY_UPLOAD_LIMIT} uploads a day and today's are used up. "
+                f"**{title}** is #{upload_queue.index(flv.name) + 1} in the queue and will upload automatically "
+                f"after the limit resets at {when_for(dj, until)}. I'll send you the link then.",
             )
-        except Exception as e:
-            log.exception("Upload of %s failed; keeping it for /retryuploads", flv.name)
-            store.set_upload(flv.name, dj, "failed", error=str(e)[:500])
-            await notify(dj, f"⚠️ Uploading **{title}** failed. It's saved and will be retried.")
-            return
-        finally:
-            mp4.unlink(missing_ok=True)
-            uploading = False
-            current_upload.clear()
-            refresh_busy()
+
+        async with upload_lock:
+            while True:
+                until = quota_wait_until()
+                if until:
+                    store.set_upload(flv.name, dj, "waiting_quota")
+                    log.info("Daily upload limit reached; %s waits until %s", flv.name, until.isoformat())
+                    await asyncio.sleep(max(5.0, (until - utcnow()).total_seconds() + QUOTA_RESET_GRACE))
+                    continue
+
+                uploading = True
+                refresh_busy()
+                store.set_upload(flv.name, dj, "uploading")
+                mp4 = flv.with_suffix(".mp4")
+                try:
+                    current_upload.update(dj=dj["name"], title=title, stage="preparing", size=flv.stat().st_size, fraction=0.0)
+                    await asyncio.to_thread(remux_to_mp4, flv)
+                    current_upload.update(stage="uploading", size=mp4.stat().st_size)
+                    video_id = await asyncio.to_thread(
+                        upload_video, mp4, title, description, dj["privacy"], TOKEN_PATH,
+                        lambda f: current_upload.update(fraction=f),
+                    )
+                    break
+                except Exception as e:
+                    if is_quota_error(e):
+                        # YouTube says the quota is gone (it can run out before our count does); wait for the reset.
+                        log.warning("YouTube quota exceeded while uploading %s; pausing uploads until reset", flv.name)
+                        store.set_setting("quota_blocked_until", next_quota_reset().isoformat())
+                        continue
+                    log.exception("Upload of %s failed; keeping it for /retryuploads", flv.name)
+                    store.set_upload(flv.name, dj, "failed", error=str(e)[:500])
+                    await notify(dj, f"⚠️ Uploading **{title}** failed. It's saved and will be retried.")
+                    return
+                finally:
+                    mp4.unlink(missing_ok=True)
+                    uploading = False
+                    current_upload.clear()
+                    refresh_busy()
+    finally:
+        upload_queue.remove(flv.name)
 
     flv.unlink(missing_ok=True)
     store.set_upload(flv.name, dj, "done", video_id=video_id)
@@ -451,10 +527,10 @@ def current_version() -> str:
 
 def queue_leftovers():
     """Queue every recording still on disk (failed uploads, or ones interrupted by a restart)."""
-    files = [
-        f for f in sorted(RECORDINGS_DIR.glob("*.flv"))
-        if (m := FILE_RE.match(f.name)) and m["key"] not in live_keys
-    ]
+    files = sorted(
+        (f for f in RECORDINGS_DIR.glob("*.flv") if (m := FILE_RE.match(f.name)) and m["key"] not in live_keys),
+        key=lambda f: FILE_RE.match(f.name)["stamp"],  # oldest set first, so the queue keeps its order
+    )
     for flv in files:
         queue_recording(flv)
     return len(files)
@@ -810,12 +886,24 @@ async def status(interaction: discord.Interaction):
     else:
         lines.append("Nothing uploading right now.")
 
-    waiting = store.uploads(["awaiting_title", "queued", "failed"])
-    if waiting:
+    used = uploads_today()
+    until = quota_wait_until()
+    reset = next_quota_reset()
+    hours, mins = divmod(int((reset - now).total_seconds() // 60), 60)
+    lines.append(
+        f"\n**📅 Today:** {used}/{DAILY_UPLOAD_LIMIT} uploads used · resets at midnight Pacific (in {hours}h {mins}m)"
+        + (" · **paused, YouTube's limit is used up**" if until else "")
+    )
+
+    in_line = [store.upload(name) for name in upload_queue if not current_upload or store.upload(name)["status"] != "uploading"]
+    other = store.uploads(["awaiting_title", "failed"])
+    if in_line or other:
         lines.append("\n**⏳ Waiting**")
-        labels = {"awaiting_title": "waiting for the DJ to pick a title", "queued": "next in line to upload",
-                  "failed": "upload failed; will retry"}
-        for r in waiting[:10]:
+        for i, r in enumerate(in_line, 1):
+            why = "waiting for the daily limit to reset" if r["status"] == "waiting_quota" else "next in line"
+            lines.append(f"{i}. @{r['dj_name']}: **{r['title']}**, {why}")
+        labels = {"awaiting_title": "waiting for the DJ to pick a title", "failed": "upload failed; /retryuploads"}
+        for r in other[:10]:
             lines.append(f"• @{r['dj_name']}: {labels[r['status']]}" + (f" ({r['title']})" if r["title"] else ""))
 
     done = store.uploads(["done"])[:3]
@@ -835,7 +923,7 @@ async def status(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_guild=True)
 @owner_only()
 async def uploads(interaction: discord.Interaction):
-    rows = store.uploads(["awaiting_title", "queued", "uploading", "failed", "done"])[:15]
+    rows = store.uploads(["awaiting_title", "queued", "waiting_quota", "uploading", "failed", "done"])[:15]
     if not rows:
         await interaction.response.send_message("No uploads yet.", ephemeral=True)
         return
