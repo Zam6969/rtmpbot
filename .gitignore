@@ -1,0 +1,5 @@
+.env
+config/*
+!config/.keep
+client_secret.json
+token.json

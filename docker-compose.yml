@@ -1,0 +1,23 @@
+services:
+  rtmp:
+    build: ./rtmp
+    restart: unless-stopped
+    ports:
+      - "1935:1935"
+    environment:
+      TZ: UTC  # file names are stamped in UTC; the bot converts to each DJ's timezone
+    volumes:
+      - recordings:/recordings
+    depends_on:
+      - bot
+
+  bot:
+    build: ./bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - recordings:/recordings
+      - ./config:/config
+
+volumes:
+  recordings:

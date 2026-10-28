@@ -1,0 +1,5 @@
+discord.py==2.5.2
+google-api-python-client==2.149.0
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+tzdata==2024.2
