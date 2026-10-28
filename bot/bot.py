@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -911,6 +912,18 @@ async def status(interaction: discord.Interaction):
         lines.append("\n**✅ Last uploads**")
         for r in done:
             lines.append(f"• @{r['dj_name']}: [{r['title'] or 'video'}](https://youtu.be/{r['video_id']})")
+
+    disk = shutil.disk_usage(RECORDINGS_DIR)  # the recordings volume lives on the server's main disk
+    pending = sum(f.stat().st_size for f in RECORDINGS_DIR.glob("*") if f.is_file())
+    hours_left = disk.free / 2.5e9  # a 1080p set is roughly 2-3 GB per hour
+    lines.append(
+        # used + free rather than total: Linux reserves ~5% of the disk that nobody but root can use.
+        f"\n**💾 Storage:** {gb(disk.used)} used of {gb(disk.used + disk.free)} "
+        f"({disk.used / (disk.used + disk.free) * 100:.0f}%) · "
+        f"**{gb(disk.free)} free** (about {hours_left:.0f} hours of recording)\n"
+        f"Recordings waiting on the server: {gb(pending)}"
+        + ("\n⚠️ **Disk is almost full.** New sets may fail to record." if disk.free < 10e9 else "")
+    )
 
     lines.append(
         f"\n-# YouTube: {'connected' if TOKEN_PATH.exists() else '**not connected** (/youtube connect)'}"
