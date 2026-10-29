@@ -6,8 +6,10 @@ The bot runs everything:
 1. A DJ runs **`/register`** and gives a username, their timezone, and whether their videos should be
    **public** or **unlisted**. The bot privately replies with their personal RTMP key and where to paste it in VRCDN.
 2. The DJ streams. Several DJs can stream at the same time; each set is recorded with video and audio.
-3. When a set ends, the bot **DMs the DJ** asking whether they want a custom title. If they don't answer within
-   30 minutes, it uses the default: **`@username on mm/dd/yyyy VRCHAT`**, dated in the DJ's own timezone.
+3. When a set ends, the bot **DMs the DJ** with three buttons: **Custom title**, **Use default title**, or
+   **Cancel upload & delete VOD** (asks to confirm, then deletes the recording without uploading). If they don't
+   answer within 30 minutes, it uploads with the default title: **`@username on mm/dd/yyyy VRCHAT`**, dated in
+   the DJ's own timezone.
 4. The bot uploads the set to YouTube, **DMs the DJ the link**, and deletes the recording from the server.
 
 If a DJ's DMs are closed, the bot posts the title question and the link in the channel where they last used a bot command, mentioning them; only that DJ can press the buttons. `/register` sends a test DM and warns them if it can't reach them.

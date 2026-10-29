@@ -239,13 +239,10 @@ class TitleView(discord.ui.View):
         self.default = default
         self.dj_id = dj_id
         self.chosen: str | None = None
+        self.cancelled = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # When posted in a channel (DMs closed), only the DJ whose set it is may pick the title.
-        if interaction.user.id != self.dj_id:
-            await interaction.response.send_message("This isn't your set.", ephemeral=True)
-            return False
-        return True
+        return await only_dj(interaction, self.dj_id)
 
     @discord.ui.button(label="Custom title", style=discord.ButtonStyle.primary)
     async def custom(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -258,6 +255,46 @@ class TitleView(discord.ui.View):
             content=f"Got it! Uploading as **{self.default}**. I'll send you the link when it's up.", view=None
         )
         self.stop()
+
+    @discord.ui.button(label="Cancel upload & delete VOD", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=interaction.message.content + "\n\n**Delete this set?** It won't be uploaded and can't be recovered.",
+            view=ConfirmDeleteView(self, interaction.message.content),
+        )
+
+
+class ConfirmDeleteView(discord.ui.View):
+    """Second step of "Cancel upload & delete VOD", so a misclick can't throw away a set."""
+
+    def __init__(self, title_view: TitleView, original_content: str):
+        super().__init__(timeout=None)
+        self.title_view = title_view
+        self.original_content = original_content
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await only_dj(interaction, self.title_view.dj_id)
+
+    @discord.ui.button(label="Yes, delete it", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.title_view.is_finished():  # the title deadline passed while this question was open
+            await interaction.response.edit_message(content="Too late, this set is already being uploaded.", view=None)
+            return
+        self.title_view.cancelled = True
+        await interaction.response.edit_message(content="🗑️ Deleted. This set won't be uploaded.", view=None)
+        self.title_view.stop()
+
+    @discord.ui.button(label="No, keep it", style=discord.ButtonStyle.secondary)
+    async def keep(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=self.original_content, view=self.title_view)
+
+
+async def only_dj(interaction: discord.Interaction, dj_id: int) -> bool:
+    # When posted in a channel (DMs closed), only the DJ whose set it is may press the buttons.
+    if interaction.user.id != dj_id:
+        await interaction.response.send_message("This isn't your set.", ephemeral=True)
+        return False
+    return True
 
 
 async def dm(discord_id: int, content: str, view: discord.ui.View | None = None):
@@ -293,13 +330,15 @@ async def notify(dj, content: str, view: discord.ui.View | None = None):
         return None
 
 
-async def ask_for_title(dj, default: str, minutes: float) -> str:
+async def ask_for_title(dj, default: str, minutes: float) -> str | None:
+    """The title to upload with, or None if the DJ chose to delete the set."""
     view = TitleView(default, dj["discord_id"])
     msg = await notify(
         dj,
         f"🎧 Your set ({minutes:.0f} min) finished recording and is ready to upload to YouTube.\n"
         f"Default title: **{default}**\n"
-        f"Want a custom title? If you don't pick within {TITLE_WAIT_MINUTES:g} minutes, I'll use the default.",
+        f"Want a custom title, or don't want this one uploaded? "
+        f"If you don't pick within {TITLE_WAIT_MINUTES:g} minutes, I'll upload it with the default title.",
         view,
     )
     if msg is None:
@@ -312,6 +351,8 @@ async def ask_for_title(dj, default: str, minutes: float) -> str:
             await msg.edit(content=f"No answer, so I'm uploading it as **{default}**. Link coming soon.", view=None)
         except discord.HTTPException:
             pass
+    if view.cancelled:
+        return None
     return view.chosen or default
 
 
@@ -408,7 +449,13 @@ async def _process_recording(flv: Path):
     title = row["title"] if row and row["title"] else None
     if title is None:
         store.set_upload(flv.name, dj, "awaiting_title")
-        title = clean_title(await ask_for_title(dj, clean_title(default_title(dj["name"], started)), seconds / 60))
+        title = await ask_for_title(dj, clean_title(default_title(dj["name"], started)), seconds / 60)
+        if title is None:
+            log.info("%s chose to delete %s instead of uploading", dj["name"], flv.name)
+            flv.unlink(missing_ok=True)
+            store.set_upload(flv.name, dj, "cancelled")
+            return
+        title = clean_title(title)
         store.set_upload(flv.name, dj, "queued", title=title)
 
     description = f"Live set by @{dj['name']}, recorded {started:%m/%d/%Y %I:%M %p %Z}."
