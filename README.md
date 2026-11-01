@@ -30,7 +30,7 @@ If a DJ's DMs are closed, the bot posts the title question and the link in the c
 | `/uploads` | admins | Shows recent uploads and any that failed. |
 | `/retryuploads` | admins | Retries recordings still on the server (for example, when YouTube quota ran out). |
 
-"Admins" means the bot owner: only the Discord user IDs in `OWNER_IDS` (default `464865517354614805`) can use these, and Discord only shows them to people with **Manage Server**. All command replies are private: only the person who ran the command sees them. DJs can also use `/register`, `/settings` and `/resetkey` in a DM with the bot; the admin commands only work in the server.
+"Admins" means the bot owner: only the Discord user IDs in `OWNER_IDS` (default `464865517354614805`) can use these, and Discord only shows them to people with **Manage Server**. All command replies are private: only the person who ran the command sees them. `/register`, `/settings`, `/resetkey`, `/sendsetup` and `/update` also work in a DM with the bot; the other admin commands only work in the server.
 
 ## Install
 

@@ -636,11 +636,11 @@ class Bot(discord.Client):
         asyncio.create_task(housekeeping())
 
         if GUILD_ID:
-            # Admin commands live only in the server. The DJ commands stay global so they also work in the
+            # Most admin commands live only in the server. DM_COMMANDS stay global so they also work in the
             # bot's DMs. Syncing both sets replaces whatever older versions registered.
             guild = discord.Object(id=GUILD_ID)
             for cmd in list(self.tree.get_commands()):
-                if cmd.name not in DJ_COMMANDS:
+                if cmd.name not in DM_COMMANDS:
                     self.tree.remove_command(cmd.name)
                     self.tree.add_command(cmd, guild=guild)
             await self.tree.sync(guild=guild)
@@ -658,7 +658,8 @@ class Bot(discord.Client):
 
 
 bot = Bot()
-DJ_COMMANDS = {"register", "settings", "resetkey"}  # usable in the server and in DMs with the bot
+# Usable in the server and in DMs with the bot. sendsetup and update are still owner-only (see owner_only).
+DM_COMMANDS = {"register", "settings", "resetkey", "sendsetup", "update"}
 
 
 def remember_channel(interaction: discord.Interaction):
@@ -1006,6 +1007,7 @@ async def uploads(interaction: discord.Interaction):
 
 
 @bot.tree.command(description="Admin: update the bot to the latest version from GitHub")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
 @app_commands.default_permissions(manage_guild=True)
 @owner_only()
 async def update(interaction: discord.Interaction):
@@ -1041,6 +1043,7 @@ def setup_instructions(guild_name: str, already_registered: bool) -> str:
 
 
 @bot.tree.command(description="Admin: DM someone the instructions for streaming with the bot")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
 @app_commands.describe(user="Who to send them to (pick them, or paste their user ID)")
 @app_commands.default_permissions(manage_guild=True)
 @owner_only()
@@ -1048,7 +1051,8 @@ async def sendsetup(interaction: discord.Interaction, user: discord.User):
     if user.bot:
         await interaction.response.send_message("That's a bot account.", ephemeral=True)
         return
-    guild_name = interaction.guild.name if interaction.guild else "the server"
+    guild = interaction.guild or (bot.get_guild(GUILD_ID) if GUILD_ID else None)
+    guild_name = guild.name if guild else "the server"
     text = setup_instructions(guild_name, store.dj_by_id(user.id) is not None)
     try:
         await user.send(text)
@@ -1056,6 +1060,14 @@ async def sendsetup(interaction: discord.Interaction, user: discord.User):
         return
     except discord.HTTPException as e:
         log.info("Couldn't DM setup instructions to %s: %s", user.id, e)
+    if interaction.guild is None:
+        # Run from the owner's DMs, so there's no channel the other person could see.
+        await interaction.response.send_message(
+            f"I couldn't DM {user.mention}. Their DMs may be closed, or they're not in **{guild_name}** yet. "
+            "Run `/sendsetup` in a server channel and I'll post it there for them instead.",
+            ephemeral=True,
+        )
+        return
     # Their DMs are closed (or they're not in a server with the bot): post here instead, mentioning them.
     try:
         await interaction.channel.send(
