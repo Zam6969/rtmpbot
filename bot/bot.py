@@ -1021,11 +1021,19 @@ async def update(interaction: discord.Interaction):
     )
 
 
-def setup_instructions(guild_name: str, already_registered: bool) -> str:
+SETUP_IMAGE = Path(__file__).parent / "assets" / "vrcdn-custom-rtmp.png"
+
+
+def setup_image() -> discord.File | None:
+    """Screenshot of VRCDN's Stream Forwarding row (Custom RTMP + Key box), attached to /sendsetup."""
+    return discord.File(SETUP_IMAGE, filename="vrcdn-custom-rtmp.png") if SETUP_IMAGE.exists() else None
+
+
+def setup_instructions(guild_name: str, already_registered: bool, inviter: str) -> str:
     mins = MIN_RECORDING_SECONDS // 60
     return (
-        f"👋 Hi! You've been invited to stream DJ sets with the recorder bot in **{guild_name}**. "
-        "Your sets get recorded and posted to YouTube automatically.\n\n"
+        f"👋 Hi! You've been invited by **{inviter}** to try out **Auto VOD**: your DJ sets get recorded and "
+        "posted to YouTube automatically. If you wanna try it, follow the steps below.\n\n"
         + ("**1. Sign up:** you're already signed up. Type `/settings` here to see your key again.\n"
            if already_registered else
            "**1. Sign up:** type `/register` right here in this DM (or in the server) and choose:\n"
@@ -1034,10 +1042,10 @@ def setup_instructions(guild_name: str, already_registered: bool) -> str:
            "   • **privacy**: Public or Unlisted on YouTube\n")
         + "**2. Add your key to VRCDN:** the bot privately replies with your **Custom RTMP key**. Go to "
         "<https://panel.vrcdn.live/live.php>, find **Stream Forwarding**, pick **Custom RTMP** as the provider, "
-        "paste the key into the **Key** box and click **Add** (make sure it's enabled).\n"
+        "paste the key into the **Key** box and click **Add** (make sure it's enabled). See the picture below.\n"
         f"**3. Stream like normal.** When your set ends (at least {mins} minutes), I'll message you to pick a title "
         "or delete it, then send you the YouTube link.\n\n"
-        "Keep **Direct Messages** on for this server so I can reach you. "
+        f"Keep **Direct Messages** on for **{guild_name}** so I can reach you. "
         "`/settings` changes your name, timezone or privacy; `/resetkey` makes a new key if yours leaks."
     )
 
@@ -1053,9 +1061,9 @@ async def sendsetup(interaction: discord.Interaction, user: discord.User):
         return
     guild = interaction.guild or (bot.get_guild(GUILD_ID) if GUILD_ID else None)
     guild_name = guild.name if guild else "the server"
-    text = setup_instructions(guild_name, store.dj_by_id(user.id) is not None)
+    text = setup_instructions(guild_name, store.dj_by_id(user.id) is not None, interaction.user.display_name)
     try:
-        await user.send(text)
+        await user.send(text, **({"file": f} if (f := setup_image()) else {}))
         await interaction.response.send_message(f"✅ Sent the setup instructions to {user.mention} by DM.", ephemeral=True)
         return
     except discord.HTTPException as e:
@@ -1072,6 +1080,7 @@ async def sendsetup(interaction: discord.Interaction, user: discord.User):
     try:
         await interaction.channel.send(
             f"{user.mention} {text}", allowed_mentions=discord.AllowedMentions(users=[user]), suppress_embeds=True,
+            **({"file": f} if (f := setup_image()) else {}),
         )
         await interaction.response.send_message(
             f"I couldn't DM {user.mention} (their DMs are closed), so I posted the instructions here and mentioned them.",
