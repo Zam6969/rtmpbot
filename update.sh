@@ -46,10 +46,10 @@ fi
 
 changes=$(git log --format='• %s' "HEAD..origin/$BRANCH" 2>/dev/null | head -10)
 git reset -q --hard "origin/$BRANCH"
-chmod +x update.sh
+chmod +x update.sh deploy.sh
 rm -f config/version && echo "$new" > config/version
 
-if docker compose up -d --build >>"$LOG" 2>&1; then
+if ./deploy.sh >>"$LOG" 2>&1; then
   finish "Updated $old → $new.
 $changes"
 else

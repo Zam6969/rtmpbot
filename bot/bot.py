@@ -51,9 +51,19 @@ BUSY_PATH = CONFIG_DIR / "busy"
 UPDATE_REQUEST_PATH = CONFIG_DIR / "update-requested"
 UPDATE_RESULT_PATH = CONFIG_DIR / "update-result"
 VERSION_PATH = CONFIG_DIR / "version"
+# Public HTTPS address (served by Caddy) for the trim pages; no trim button without it.
+SITE_ADDRESS = os.environ.get("SITE_ADDRESS", "").strip()
+TRIM_PAGE = Path(__file__).parent / "trim.html"
+MIN_TRIMMED_SECONDS = 10
 
 # Recording files look like <streamkey>-YYYYmmdd-HHMMSS.flv, stamped in UTC (see rtmp/nginx.conf).
-FILE_RE = re.compile(r"^(?P<key>[0-9a-f]+)-(?P<stamp>\d{8}-\d{6})\.flv$")
+# Once a set ends it is remuxed to .mp4 with the same name, which the trim page plays and the upload sends.
+FILE_RE = re.compile(r"^(?P<key>[0-9a-f]+)-(?P<stamp>\d{8}-\d{6})\.(?:flv|mp4)$")
+
+
+def rec_name(path: Path) -> str:
+    """Database key for a recording, the same whichever stage (.flv or .mp4) its file is in."""
+    return f"{path.stem}.flv"
 
 ALL_TIMEZONES = sorted(available_timezones())
 COMMON_TIMEZONES = [
@@ -100,6 +110,9 @@ class Store:
         self._add_column("djs", "channel_id", "INTEGER")  # where to post if their DMs are closed
         self._add_column("uploads", "discord_id", "INTEGER")
         self._add_column("uploads", "title", "TEXT")
+        self._add_column("uploads", "trim_token", "TEXT")  # secret part of the trim page link
+        self._add_column("uploads", "trim_start", "REAL")  # seconds; NULL means no trim
+        self._add_column("uploads", "trim_end", "REAL")
 
     def _add_column(self, table: str, column: str, spec: str):
         cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
@@ -130,26 +143,23 @@ class Store:
     def upload(self, file: str):
         return self.db.execute("SELECT * FROM uploads WHERE file = ?", (file,)).fetchone()
 
+    def upload_by_token(self, token: str):
+        return self.db.execute("SELECT * FROM uploads WHERE trim_token = ?", (token,)).fetchone()
+
     def set_upload(self, file: str, dj, status: str, **fields):
-        row = self.upload(file)
-        values = {
-            "dj_name": dj["name"],
-            "discord_id": dj["discord_id"],
-            "status": status,
-            "video_id": row["video_id"] if row else None,
-            "error": None,
-            "title": row["title"] if row else None,
-            "updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        }
-        values.update(fields)
+        """Update a recording's row; columns not given keep their value, except error which is cleared."""
+        row = dict(self.upload(file) or {})
+        row.update(
+            file=file, dj_name=dj["name"], discord_id=dj["discord_id"], status=status, error=None,
+            updated=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        )
+        row.update(fields)
+        cols = ["file", "dj_name", "discord_id", "status", "video_id", "error", "title", "updated",
+                "trim_token", "trim_start", "trim_end"]
         with self.db:
             self.db.execute(
-                "INSERT INTO uploads (file, dj_name, discord_id, status, video_id, error, title, updated) "
-                "VALUES (:file, :dj_name, :discord_id, :status, :video_id, :error, :title, :updated) "
-                "ON CONFLICT(file) DO UPDATE SET dj_name = excluded.dj_name, discord_id = excluded.discord_id, "
-                "status = excluded.status, video_id = excluded.video_id, error = excluded.error, "
-                "title = excluded.title, updated = excluded.updated",
-                {"file": file, **values},
+                f"INSERT OR REPLACE INTO uploads ({', '.join(cols)}) VALUES ({', '.join(':' + c for c in cols)})",
+                {c: row.get(c) for c in cols},
             )
 
     def get_setting(self, name: str):
@@ -205,12 +215,31 @@ def duration_seconds(path: Path) -> float:
 
 
 def remux_to_mp4(src: Path) -> Path:
-    dst = src.with_suffix(".mp4")
+    """Rewrap a .flv recording as .mp4 (no re-encode). Written under a temporary name so a crash never
+    leaves a half-written .mp4 that looks finished."""
+    tmp, dst = src.with_suffix(".remux.mp4"), src.with_suffix(".mp4")
     subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-c", "copy", "-movflags", "+faststart", str(dst)],
+        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-c", "copy", "-movflags", "+faststart", str(tmp)],
+        check=True,
+    )
+    tmp.replace(dst)
+    return dst
+
+
+def trim_video(src: Path, start: float, end: float) -> Path:
+    """Copy out start..end without re-encoding (cuts land on the nearest keyframe, usually within 1-2 s)."""
+    dst = src.with_name(f"{src.stem}.trim.mp4")
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{end - start:.3f}",
+         "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(dst)],
         check=True,
     )
     return dst
+
+
+def fmt_time(seconds: float) -> str:
+    seconds = int(round(seconds))
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
 # ---- Asking the DJ for a title ------------------------------------------------
@@ -234,12 +263,14 @@ class TitleModal(discord.ui.Modal, title="Custom video title"):
 
 
 class TitleView(discord.ui.View):
-    def __init__(self, default: str, dj_id: int):
+    def __init__(self, default: str, dj_id: int, trim_url: str | None = None):
         super().__init__(timeout=None)  # ask_for_title enforces the deadline itself
         self.default = default
         self.dj_id = dj_id
         self.chosen: str | None = None
         self.cancelled = False
+        if trim_url:
+            self.add_item(discord.ui.Button(label="✂️ Trim video", style=discord.ButtonStyle.link, url=trim_url))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await only_dj(interaction, self.dj_id)
@@ -330,22 +361,41 @@ async def notify(dj, content: str, view: discord.ui.View | None = None):
         return None
 
 
-async def ask_for_title(dj, default: str, minutes: float) -> str | None:
+# Title prompts waiting for an answer, by recording, so the trim page can extend or finish them.
+# rec name -> {"view": TitleView, "msg": Message, "content": str, "activity": loop time of last trim-page use}
+prompts: dict[str, dict] = {}
+
+
+async def ask_for_title(dj, default: str, minutes: float, rec: str, trim_url: str | None) -> str | None:
     """The title to upload with, or None if the DJ chose to delete the set."""
-    view = TitleView(default, dj["discord_id"])
-    msg = await notify(
-        dj,
+    view = TitleView(default, dj["discord_id"], trim_url)
+    content = (
         f"🎧 Your set ({minutes:.0f} min) finished recording and is ready to upload to YouTube.\n"
         f"Default title: **{default}**\n"
         f"Want a custom title, or don't want this one uploaded? "
-        f"If you don't pick within {TITLE_WAIT_MINUTES:g} minutes, I'll upload it with the default title.",
-        view,
+        f"If you don't pick within {TITLE_WAIT_MINUTES:g} minutes, I'll upload it with the default title."
+        + ("\n✂️ Need to cut the start or end? Use **Trim video**. The timer waits while you're trimming."
+           if trim_url else "")
     )
+    msg = await notify(dj, content, view)
     if msg is None:
         return default
+
+    loop = asyncio.get_running_loop()
+    asked_at = loop.time()
+    prompts[rec] = {"view": view, "msg": msg, "content": content, "activity": asked_at}
+    waiter = asyncio.ensure_future(view.wait())
     try:
-        await asyncio.wait_for(view.wait(), TITLE_WAIT_MINUTES * 60)
-    except asyncio.TimeoutError:
+        while not waiter.done():
+            # The deadline counts from the prompt, or from the last time the DJ used the trim page.
+            remaining = max(asked_at, prompts[rec]["activity"]) + TITLE_WAIT_MINUTES * 60 - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.wait({waiter}, timeout=remaining)
+    finally:
+        prompts.pop(rec, None)
+
+    if not waiter.done():
         view.stop()
         try:
             await msg.edit(content=f"No answer, so I'm uploading it as **{default}**. Link coming soon.", view=None)
@@ -400,45 +450,54 @@ def when_for(dj, moment: dt.datetime) -> str:
     return f"{local:%I:%M %p %Z} on {local:%m/%d}".lstrip("0")
 
 
-def queue_recording(flv: Path):
-    if flv.name not in queued:
-        queued.add(flv.name)
-        asyncio.create_task(process_recording(flv))
+def queue_recording(path: Path):
+    rec = rec_name(path)
+    if rec not in queued:
+        queued.add(rec)
+        asyncio.create_task(process_recording(path))
 
 
-async def process_recording(flv: Path):
+async def process_recording(path: Path):
     try:
-        await _process_recording(flv)
+        await _process_recording(path)
     except Exception:
-        log.exception("Unexpected error handling %s", flv.name)
+        log.exception("Unexpected error handling %s", path.name)
     finally:
-        queued.discard(flv.name)
+        queued.discard(rec_name(path))
 
 
-async def _process_recording(flv: Path):
-    m = FILE_RE.match(flv.name)
-    if not m or not flv.exists():
-        log.warning("Ignoring unexpected file %s", flv)
+async def _process_recording(path: Path):
+    m = FILE_RE.match(path.name)
+    rec = rec_name(path)
+    flv, mp4 = path.with_suffix(".flv"), path.with_suffix(".mp4")
+    if not m or not (flv.exists() or mp4.exists()):
+        log.warning("Ignoring unexpected file %s", path)
         return
 
     # Prefer the DJ remembered for this file, so a key reset mid-upload doesn't lose track of whose set it is.
-    row = store.upload(flv.name)
+    row = store.upload(rec)
     dj = store.dj_by_id(row["discord_id"]) if row and row["discord_id"] else store.dj_by_key(m["key"])
     if dj is None:
-        log.warning("No DJ for %s; leaving it on disk", flv.name)
+        log.warning("No DJ for %s; leaving it on disk", path.name)
         return
 
-    seconds = await asyncio.to_thread(duration_seconds, flv)
+    seconds = await asyncio.to_thread(duration_seconds, mp4 if mp4.exists() else flv)
     if seconds < MIN_RECORDING_SECONDS:
-        log.info("%s is only %.0fs; deleting without upload", flv.name, seconds)
+        log.info("%s is only %.0fs; deleting without upload", path.name, seconds)
         flv.unlink(missing_ok=True)
-        store.set_upload(flv.name, dj, "skipped", error=f"too short ({seconds:.0f}s)")
+        mp4.unlink(missing_ok=True)
+        store.set_upload(rec, dj, "skipped", error=f"too short ({seconds:.0f}s)")
         await notify(
             dj,
             f"Your stream was only {seconds:.0f} seconds, so I didn't upload it. Sets need to be at least "
             f"{MIN_RECORDING_SECONDS // 60} minutes{f' {MIN_RECORDING_SECONDS % 60} seconds' if MIN_RECORDING_SECONDS % 60 else ''} long.",
         )
         return
+
+    # Rewrap as .mp4 once, right away: browsers can play it on the trim page, and it's what gets uploaded.
+    if not mp4.exists():
+        await asyncio.to_thread(remux_to_mp4, flv)
+    flv.unlink(missing_ok=True)
 
     started_utc = dt.datetime.strptime(m["stamp"], "%Y%m%d-%H%M%S").replace(tzinfo=dt.timezone.utc)
     try:
@@ -448,29 +507,31 @@ async def _process_recording(flv: Path):
 
     title = row["title"] if row and row["title"] else None
     if title is None:
-        store.set_upload(flv.name, dj, "awaiting_title")
-        title = await ask_for_title(dj, clean_title(default_title(dj["name"], started)), seconds / 60)
+        token = (row["trim_token"] if row else None) or secrets.token_urlsafe(18)
+        store.set_upload(rec, dj, "awaiting_title", trim_token=token)
+        trim_url = f"https://{SITE_ADDRESS}/trim/{token}" if SITE_ADDRESS else None
+        title = await ask_for_title(dj, clean_title(default_title(dj["name"], started)), seconds / 60, rec, trim_url)
         if title is None:
-            log.info("%s chose to delete %s instead of uploading", dj["name"], flv.name)
-            flv.unlink(missing_ok=True)
-            store.set_upload(flv.name, dj, "cancelled")
+            log.info("%s chose to delete %s instead of uploading", dj["name"], path.name)
+            mp4.unlink(missing_ok=True)
+            store.set_upload(rec, dj, "cancelled")
             return
         title = clean_title(title)
-        store.set_upload(flv.name, dj, "queued", title=title)
+        store.set_upload(rec, dj, "queued", title=title)
 
     description = f"Live set by @{dj['name']}, recorded {started:%m/%d/%Y %I:%M %p %Z}."
 
     global uploading
-    upload_queue.append(flv.name)
+    upload_queue.append(rec)
     try:
         # Tell the DJ up front if YouTube's daily limit means their set has to wait.
         until = quota_wait_until()
-        if until and (store.upload(flv.name)["status"] != "waiting_quota"):
-            store.set_upload(flv.name, dj, "waiting_quota")
+        if until and (store.upload(rec)["status"] != "waiting_quota"):
+            store.set_upload(rec, dj, "waiting_quota")
             await notify(
                 dj,
                 f"⏳ YouTube only allows {DAILY_UPLOAD_LIMIT} uploads a day and today's are used up. "
-                f"**{title}** is #{upload_queue.index(flv.name) + 1} in the queue and will upload automatically "
+                f"**{title}** is #{upload_queue.index(rec) + 1} in the queue and will upload automatically "
                 f"after the limit resets at {when_for(dj, until)}. I'll send you the link then.",
             )
 
@@ -478,45 +539,50 @@ async def _process_recording(flv: Path):
             while True:
                 until = quota_wait_until()
                 if until:
-                    store.set_upload(flv.name, dj, "waiting_quota")
-                    log.info("Daily upload limit reached; %s waits until %s", flv.name, until.isoformat())
+                    store.set_upload(rec, dj, "waiting_quota")
+                    log.info("Daily upload limit reached; %s waits until %s", path.name, until.isoformat())
                     await asyncio.sleep(max(5.0, (until - utcnow()).total_seconds() + QUOTA_RESET_GRACE))
                     continue
 
                 uploading = True
                 refresh_busy()
-                store.set_upload(flv.name, dj, "uploading")
-                mp4 = flv.with_suffix(".mp4")
+                store.set_upload(rec, dj, "uploading")
+                row = store.upload(rec)  # the DJ may have saved a trim while the set waited in the queue
+                trimmed = None
                 try:
-                    current_upload.update(dj=dj["name"], title=title, stage="preparing", size=flv.stat().st_size, fraction=0.0)
-                    await asyncio.to_thread(remux_to_mp4, flv)
-                    current_upload.update(stage="uploading", size=mp4.stat().st_size)
+                    current_upload.update(dj=dj["name"], title=title, stage="preparing", size=mp4.stat().st_size, fraction=0.0)
+                    if row["trim_start"] is not None:
+                        current_upload.update(stage="trimming")
+                        trimmed = await asyncio.to_thread(trim_video, mp4, row["trim_start"], row["trim_end"])
+                    to_send = trimmed or mp4
+                    current_upload.update(stage="uploading", size=to_send.stat().st_size)
                     video_id = await asyncio.to_thread(
-                        upload_video, mp4, title, description, dj["privacy"], TOKEN_PATH,
+                        upload_video, to_send, title, description, dj["privacy"], TOKEN_PATH,
                         lambda f: current_upload.update(fraction=f),
                     )
                     break
                 except Exception as e:
                     if is_quota_error(e):
                         # YouTube says the quota is gone (it can run out before our count does); wait for the reset.
-                        log.warning("YouTube quota exceeded while uploading %s; pausing uploads until reset", flv.name)
+                        log.warning("YouTube quota exceeded while uploading %s; pausing uploads until reset", path.name)
                         store.set_setting("quota_blocked_until", next_quota_reset().isoformat())
                         continue
-                    log.exception("Upload of %s failed; keeping it for /retryuploads", flv.name)
-                    store.set_upload(flv.name, dj, "failed", error=str(e)[:500])
+                    log.exception("Upload of %s failed; keeping it for /retryuploads", path.name)
+                    store.set_upload(rec, dj, "failed", error=str(e)[:500])
                     await notify(dj, f"⚠️ Uploading **{title}** failed. It's saved and will be retried.")
                     return
                 finally:
-                    mp4.unlink(missing_ok=True)
+                    if trimmed:
+                        trimmed.unlink(missing_ok=True)
                     uploading = False
                     current_upload.clear()
                     refresh_busy()
     finally:
-        upload_queue.remove(flv.name)
+        upload_queue.remove(rec)
 
-    flv.unlink(missing_ok=True)
-    store.set_upload(flv.name, dj, "done", video_id=video_id)
-    log.info("Uploaded %s as https://youtu.be/%s (%s)", flv.name, video_id, title)
+    mp4.unlink(missing_ok=True)
+    store.set_upload(rec, dj, "done", video_id=video_id)
+    log.info("Uploaded %s as https://youtu.be/%s (%s)", path.name, video_id, title)
     await notify(
         dj,
         f"✅ **{title}** is on YouTube ({dj['privacy']}):\nhttps://youtu.be/{video_id}\n"
@@ -575,12 +641,15 @@ def current_version() -> str:
 
 def queue_leftovers():
     """Queue every recording still on disk (failed uploads, or ones interrupted by a restart)."""
-    files = sorted(
-        (f for f in RECORDINGS_DIR.glob("*.flv") if (m := FILE_RE.match(f.name)) and m["key"] not in live_keys),
-        key=lambda f: FILE_RE.match(f.name)["stamp"],  # oldest set first, so the queue keeps its order
-    )
-    for flv in files:
-        queue_recording(flv)
+    for junk in [*RECORDINGS_DIR.glob("*.remux.mp4"), *RECORDINGS_DIR.glob("*.trim.mp4")]:
+        junk.unlink(missing_ok=True)  # half-made temporary files from before a restart
+    recordings = {}
+    for f in [*RECORDINGS_DIR.glob("*.flv"), *RECORDINGS_DIR.glob("*.mp4")]:
+        if (m := FILE_RE.match(f.name)) and m["key"] not in live_keys:
+            recordings.setdefault(f.stem, f)  # .flv and .mp4 of one set are the same recording
+    files = sorted(recordings.values(), key=lambda f: FILE_RE.match(f.name)["stamp"])  # oldest set first
+    for path in files:
+        queue_recording(path)
     return len(files)
 
 
@@ -616,6 +685,112 @@ async def on_record_done(request: web.Request):
     return web.Response(text="ok")
 
 
+# ---- Trim page (public, behind Caddy) ---------------------------------------------
+
+TRIMMABLE = ("awaiting_title", "queued", "waiting_quota")  # after this the upload has started
+
+
+def trim_row(request: web.Request):
+    """The recording a trim link belongs to, and its .mp4, or (None, None) if the link is unknown."""
+    row = store.upload_by_token(request.match_info["token"])
+    if row is None:
+        return None, None
+    return row, RECORDINGS_DIR / f"{Path(row['file']).stem}.mp4"
+
+
+def note_trim_activity(rec: str):
+    if rec in prompts:
+        prompts[rec]["activity"] = asyncio.get_running_loop().time()
+
+
+def simple_page(message: str, status: int = 200) -> web.Response:
+    return web.Response(
+        status=status, content_type="text/html",
+        text="<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+             "<title>Auto VOD</title><body style='font:16px system-ui;background:#111;color:#eee;display:grid;"
+             f"place-items:center;min-height:90vh;padding:16px;text-align:center'><p>{message}</p>",
+    )
+
+
+async def trim_page(request: web.Request):
+    row, mp4 = trim_row(request)
+    if row is None:
+        return simple_page("This trim link isn't valid.", 404)
+    if row["status"] == "done":
+        return simple_page(f"✅ This set is already on YouTube: <a style='color:#8ab4ff' "
+                           f"href='https://youtu.be/{row['video_id']}'>youtu.be/{row['video_id']}</a>")
+    if row["status"] not in TRIMMABLE or not mp4.exists():
+        return simple_page("This set can't be trimmed any more (it's uploading, uploaded or deleted).")
+    note_trim_activity(row["file"])
+    dj = store.dj_by_id(row["discord_id"])
+    data = {
+        "dj": dj["name"] if dj else row["dj_name"],
+        "title": row["title"] or (prompts[row["file"]]["view"].default if row["file"] in prompts else ""),
+        "canTitle": row["status"] == "awaiting_title" and row["file"] in prompts,
+        "start": row["trim_start"],
+        "end": row["trim_end"],
+    }
+    # Embedded as JSON in a <script>; escaping "<" keeps a title like "</script>" from breaking out.
+    html = TRIM_PAGE.read_text().replace("__DATA__", json.dumps(data).replace("<", "\\u003c"))
+    return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+async def trim_video_file(request: web.Request):
+    row, mp4 = trim_row(request)
+    if row is None or row["status"] not in TRIMMABLE or not mp4.exists():
+        raise web.HTTPNotFound()
+    note_trim_activity(row["file"])
+    return web.FileResponse(mp4, headers={"Cache-Control": "private, max-age=3600"})  # supports seeking (Range)
+
+
+async def trim_save(request: web.Request):
+    row, mp4 = trim_row(request)
+    if row is None:
+        raise web.HTTPNotFound()
+    if row["status"] not in TRIMMABLE or not mp4.exists():
+        return web.json_response({"ok": False, "message": "Too late: this set is already uploading."}, status=409)
+    try:
+        body = await request.json()
+        start, end = float(body["start"]), float(body["end"])
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"ok": False, "message": "That trim didn't make sense."}, status=400)
+
+    duration = await asyncio.to_thread(duration_seconds, mp4)
+    start, end = max(0.0, start), min(duration, end)
+    if end - start < MIN_TRIMMED_SECONDS:
+        return web.json_response(
+            {"ok": False, "message": f"The trimmed set must be at least {MIN_TRIMMED_SECONDS} seconds long."}, status=400)
+    if start < 1 and end > duration - 1:
+        start = end = None  # the whole set: no trim
+
+    rec, dj = row["file"], store.dj_by_id(row["discord_id"])
+    store.set_upload(rec, dj, row["status"], trim_start=start, trim_end=end)
+    note_trim_activity(rec)
+    trim_text = f"✂️ **Trim saved:** {fmt_time(start)} → {fmt_time(end)} ({fmt_time(end - start)} long)" \
+        if start is not None else "✂️ No trim: the whole set will be uploaded."
+
+    prompt = prompts.get(rec)
+    if body.get("upload") and prompt and row["status"] == "awaiting_title":
+        title = clean_title(str(body.get("title", ""))) or prompt["view"].default
+        prompt["view"].chosen = title
+        prompt["view"].stop()
+        try:
+            await prompt["msg"].edit(
+                content=f"Got it! Uploading as **{title}**. I'll send you the link when it's up.\n{trim_text}", view=None)
+        except discord.HTTPException:
+            pass
+        return web.json_response({"ok": True, "done": True,
+                                  "message": "Saved! It's uploading now. I'll send you the link in Discord."})
+    if prompt:
+        try:
+            await prompt["msg"].edit(content=f"{prompt['content']}\n\n{trim_text}")
+        except discord.HTTPException:
+            pass
+    return web.json_response({"ok": True, "message": "Trim saved." + (
+        " Pick a title in Discord, or it'll upload with the default when the timer runs out."
+        if prompt else " It will be used when your set uploads.")})
+
+
 # ---- Discord commands ---------------------------------------------------------
 
 class Bot(discord.Client):
@@ -631,7 +806,15 @@ class Bot(discord.Client):
         app.router.add_post("/rtmp/record_done", on_record_done)
         runner = web.AppRunner(app)
         await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", 8080).start()
+        await web.TCPSite(runner, "0.0.0.0", 8080).start()  # nginx-rtmp callbacks; never exposed publicly
+
+        trim_app = web.Application()
+        trim_app.router.add_get("/trim/{token}", trim_page)
+        trim_app.router.add_get("/trim/{token}/video", trim_video_file)
+        trim_app.router.add_post("/trim/{token}", trim_save)
+        trim_runner = web.AppRunner(trim_app)
+        await trim_runner.setup()
+        await web.TCPSite(trim_runner, "0.0.0.0", 8081).start()  # reached through Caddy (HTTPS)
 
         asyncio.create_task(housekeeping())
 
@@ -939,8 +1122,8 @@ async def status(interaction: discord.Interaction):
     lines.append("\n**⬆️ Upload**")
     if current_upload:
         u = current_upload
-        if u["stage"] == "preparing":
-            lines.append(f"• @{u['dj']}: **{u['title']}**, preparing the file ({gb(u['size'])})")
+        if u["stage"] in ("preparing", "trimming"):
+            lines.append(f"• @{u['dj']}: **{u['title']}**, {'cutting the trim' if u['stage'] == 'trimming' else 'preparing the file'} ({gb(u['size'])})")
         else:
             lines.append(f"• @{u['dj']}: **{u['title']}**, {u['fraction'] * 100:.0f}% of {gb(u['size'])} sent to YouTube")
     else:

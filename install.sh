@@ -30,19 +30,10 @@ git fetch -q origin "$BRANCH"
 git reset -q --hard "origin/$BRANCH"
 git branch -q -M "$BRANCH" 2>/dev/null || true
 git branch -q --set-upstream-to="origin/$BRANCH" 2>/dev/null || true
-chmod +x update.sh
+chmod +x update.sh deploy.sh
 mkdir -p config
 rm -f config/version 2>/dev/null || sudo rm -f config/version
 git rev-parse --short HEAD > config/version
-
-echo "==> Opening port 1935 (RTMP) in the firewall"
-if command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
-  sudo ufw allow 1935/tcp
-fi
-if ! sudo iptables -C INPUT -p tcp --dport 1935 -j ACCEPT 2>/dev/null; then
-  sudo iptables -I INPUT 1 -p tcp --dport 1935 -j ACCEPT
-fi
-if command -v netfilter-persistent >/dev/null; then sudo netfilter-persistent save || true; fi
 
 if [ ! -f .env ]; then
   PUBLIC_IP=$(curl -fsS -4 https://api.ipify.org || hostname -I | awk '{print $1}')
@@ -64,13 +55,14 @@ echo "==> Turning on automatic updates (checks GitHub every 15 minutes, or right
 ( crontab -l 2>/dev/null | grep -v 'rtmp-recorder/update.sh' || true
   echo "* * * * * $DIR/update.sh >/dev/null 2>&1" ) | crontab -
 
-echo "==> Building and starting (first time takes a few minutes)"
-sudo docker compose up -d --build
+echo "==> Opening ports, building and starting (first time takes a few minutes)"
+./deploy.sh
 sleep 5
 sudo docker compose ps
 
 echo
 echo "Done (version $(cat config/version))."
+echo "Trim page address: https://$(grep '^SITE_ADDRESS=' .env | cut -d= -f2)"
 echo "Bot logs:  cd $DIR && sudo docker compose logs -f bot"
 echo "Admins: /youtube connect to link YouTube, /update to update right away."
 echo "DJs: /register to sign up."

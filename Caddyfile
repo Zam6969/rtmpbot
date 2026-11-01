@@ -1,0 +1,11 @@
+# Public HTTPS for the trim pages. Caddy gets and renews the certificate for SITE_ADDRESS automatically.
+# Only /trim/* is exposed; the bot's nginx-rtmp callbacks (port 8080) stay private.
+{$SITE_ADDRESS} {
+	encode gzip
+	handle /trim/* {
+		reverse_proxy bot:8081
+	}
+	handle {
+		respond "Auto VOD" 404
+	}
+}

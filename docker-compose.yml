@@ -19,5 +19,20 @@ services:
       - recordings:/recordings
       - ./config:/config
 
+  web:
+    image: caddy:2.8.4
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - bot
+
 volumes:
   recordings:
+  caddy_data:

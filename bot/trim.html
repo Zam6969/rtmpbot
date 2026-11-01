@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Trim your set · Auto VOD</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b22; --line: #2a2f3a; --text: #e8eaf0; --muted: #9aa3b2;
+    --accent: #5b8cff; --accent-text: #fff; --keep: rgba(91, 140, 255, .35); --danger: #ff6b6b; --ok: #4cd18a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f4f5f8; --panel: #fff; --line: #d9dde5; --text: #1b1e25; --muted: #5d6676;
+            --keep: rgba(91, 140, 255, .28); }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 2px; }
+  .sub { color: var(--muted); margin: 0 0 14px; }
+  video { width: 100%; max-height: 60vh; background: #000; border-radius: 10px; display: block; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-top: 14px; }
+
+  /* Timeline: two range inputs stacked on one track, with the kept part highlighted. */
+  .timeline { position: relative; height: 36px; margin: 6px 4px 2px; }
+  .track { position: absolute; left: 0; right: 0; top: 15px; height: 6px; border-radius: 3px; background: var(--line); }
+  .kept { position: absolute; top: 12px; height: 12px; border-radius: 4px; background: var(--keep); border: 1px solid var(--accent); }
+  .playhead { position: absolute; top: 6px; width: 2px; height: 24px; background: var(--text); opacity: .7; pointer-events: none; }
+  .timeline input[type=range] { position: absolute; left: 0; width: 100%; top: 6px; margin: 0; height: 24px;
+    background: none; pointer-events: none; -webkit-appearance: none; appearance: none; }
+  .timeline input[type=range]::-webkit-slider-thumb { pointer-events: auto; -webkit-appearance: none; width: 16px; height: 28px;
+    border-radius: 5px; background: var(--accent); border: 2px solid var(--accent-text); cursor: ew-resize; }
+  .timeline input[type=range]::-moz-range-thumb { pointer-events: auto; width: 14px; height: 26px; border-radius: 5px;
+    background: var(--accent); border: 2px solid var(--accent-text); cursor: ew-resize; }
+  .timeline input[type=range]::-moz-range-track { background: none; }
+  .scale { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin: 0 4px; }
+
+  .ends { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  @media (max-width: 640px) { .ends { grid-template-columns: 1fr; } }
+  .end h2 { font-size: 14px; margin: 0 0 6px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  input[type=text] { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 10px; font: inherit; }
+  .time { width: 96px; font-variant-numeric: tabular-nums; text-align: center; }
+  button { font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text);
+    padding: 8px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .summary { margin-top: 12px; color: var(--muted); }
+  .summary b { color: var(--text); font-variant-numeric: tabular-nums; }
+  label.title { display: block; font-weight: 600; margin-bottom: 6px; }
+  #title { width: 100%; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  #msg { margin-top: 10px; min-height: 1.4em; }
+  #msg.err { color: var(--danger); } #msg.ok { color: var(--ok); }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>✂️ Trim your set</h1>
+  <p class="sub" id="who"></p>
+
+  <video id="video" controls preload="metadata" playsinline></video>
+
+  <section class="panel">
+    <div class="timeline" id="timeline">
+      <div class="track"></div>
+      <div class="kept" id="kept"></div>
+      <div class="playhead" id="playhead"></div>
+      <input type="range" id="startRange" min="0" step="0.1" value="0" aria-label="Start">
+      <input type="range" id="endRange" min="0" step="0.1" value="0" aria-label="End">
+    </div>
+    <div class="scale"><span>0:00:00</span><span id="total">…</span></div>
+
+    <div class="ends">
+      <div class="end">
+        <h2>Start</h2>
+        <div class="row">
+          <input type="text" class="time" id="startText" inputmode="numeric" aria-label="Start time">
+          <button data-nudge="start" data-by="-5">−5s</button>
+          <button data-nudge="start" data-by="5">+5s</button>
+          <button id="setStart">Set to current</button>
+          <button id="playStart">▶ Play from start</button>
+        </div>
+      </div>
+      <div class="end">
+        <h2>End</h2>
+        <div class="row">
+          <input type="text" class="time" id="endText" inputmode="numeric" aria-label="End time">
+          <button data-nudge="end" data-by="-5">−5s</button>
+          <button data-nudge="end" data-by="5">+5s</button>
+          <button id="setEnd">Set to current</button>
+          <button id="playEnd">▶ Play last 10s</button>
+        </div>
+      </div>
+    </div>
+    <p class="summary">Kept: <b id="keptText">…</b> · cutting <b id="cutText">…</b></p>
+    <p class="hint">Drag the handles or type times like 1:02:30. Cuts land within a second or two of the exact spot.</p>
+  </section>
+
+  <section class="panel">
+    <div id="titleBox">
+      <label class="title" for="title">YouTube title</label>
+      <input type="text" id="title" maxlength="100">
+    </div>
+    <div class="actions">
+      <button id="save">Save trim</button>
+      <button id="saveUpload" class="primary">Save &amp; upload</button>
+      <button id="reset">Reset (no trim)</button>
+    </div>
+    <div id="msg" role="status"></div>
+  </section>
+</main>
+
+<script>
+const DATA = __DATA__;
+const $ = (id) => document.getElementById(id);
+const video = $("video"), startRange = $("startRange"), endRange = $("endRange");
+video.src = location.pathname.replace(/\/$/, "") + "/video";
+let duration = 0, start = 0, end = 0;
+
+$("who").textContent = `Set by @${DATA.dj}. Choose what to keep, then save. Only the kept part gets uploaded.`;
+if (DATA.canTitle) {
+  $("title").value = DATA.title;
+} else {
+  $("titleBox").innerHTML = DATA.title
+    ? `<b>Title:</b> ${escapeHtml(DATA.title)} <span class="hint">(already chosen)</span>` : "";
+  $("saveUpload").hidden = true;
+}
+
+function escapeHtml(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function fmt(t) {
+  t = Math.max(0, Math.round(t));
+  return `${Math.floor(t / 3600)}:${String(Math.floor(t % 3600 / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
+}
+function parse(text) {  // "1:02:03", "62:03", "3723" -> seconds, or NaN
+  const parts = text.trim().split(":").map(Number);
+  if (!parts.length || parts.some((n) => isNaN(n) || n < 0)) return NaN;
+  return parts.reduce((total, n) => total * 60 + n, 0);
+}
+const MIN_LEN = 10;
+
+function render() {
+  startRange.value = start; endRange.value = end;
+  $("startText").value = fmt(start); $("endText").value = fmt(end);
+  const pct = (t) => (duration ? (t / duration) * 100 : 0);
+  $("kept").style.left = pct(start) + "%";
+  $("kept").style.width = Math.max(0, pct(end) - pct(start)) + "%";
+  $("keptText").textContent = `${fmt(end - start)} (${fmt(start)} → ${fmt(end)})`;
+  $("cutText").textContent = `${fmt(start)} from the start, ${fmt(duration - end)} from the end`;
+}
+function setStart(t) { start = Math.min(Math.max(0, t), end - MIN_LEN); render(); }
+function setEnd(t) { end = Math.max(Math.min(duration, t), start + MIN_LEN); render(); }
+
+video.addEventListener("loadedmetadata", () => {
+  duration = video.duration;
+  startRange.max = endRange.max = duration;
+  $("total").textContent = fmt(duration);
+  start = DATA.start ?? 0;
+  end = DATA.end ?? duration;
+  render();
+});
+video.addEventListener("timeupdate", () => {
+  if (duration) $("playhead").style.left = (video.currentTime / duration) * 100 + "%";
+});
+video.addEventListener("error", () => showMsg("The video couldn't load. Try refreshing the page.", true));
+
+startRange.addEventListener("input", () => { setStart(+startRange.value); video.currentTime = start; });
+endRange.addEventListener("input", () => { setEnd(+endRange.value); video.currentTime = end; });
+$("startText").addEventListener("change", (e) => { const t = parse(e.target.value); isNaN(t) ? render() : setStart(t); });
+$("endText").addEventListener("change", (e) => { const t = parse(e.target.value); isNaN(t) ? render() : setEnd(t); });
+document.querySelectorAll("[data-nudge]").forEach((b) => b.addEventListener("click", () => {
+  const by = +b.dataset.by;
+  if (b.dataset.nudge === "start") { setStart(start + by); video.currentTime = start; }
+  else { setEnd(end + by); video.currentTime = end; }
+}));
+$("setStart").addEventListener("click", () => setStart(video.currentTime));
+$("setEnd").addEventListener("click", () => setEnd(video.currentTime));
+$("playStart").addEventListener("click", () => { video.currentTime = start; video.play(); });
+$("playEnd").addEventListener("click", () => { video.currentTime = Math.max(start, end - 10); video.play(); stopAt = end; });
+let stopAt = null;
+video.addEventListener("timeupdate", () => { if (stopAt !== null && video.currentTime >= stopAt) { video.pause(); stopAt = null; } });
+$("reset").addEventListener("click", () => { start = 0; end = duration; render(); });
+
+function showMsg(text, isError) { $("msg").textContent = text; $("msg").className = isError ? "err" : "ok"; }
+async function save(upload) {
+  if (!duration) return;
+  const buttons = document.querySelectorAll(".actions button");
+  buttons.forEach((b) => (b.disabled = true));
+  showMsg("Saving…");
+  try {
+    const res = await fetch(location.pathname, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ start, end, upload, title: DATA.canTitle ? $("title").value : undefined }),
+    });
+    const out = await res.json();
+    showMsg(out.message, !out.ok);
+    if (out.done) { video.pause(); return; }  // keep buttons disabled: it's uploading now
+  } catch (e) {
+    showMsg("Couldn't save. Check your connection and try again.", true);
+  }
+  buttons.forEach((b) => (b.disabled = false));
+}
+$("save").addEventListener("click", () => save(false));
+$("saveUpload").addEventListener("click", () => save(true));
+
+// Keep the bot's title timer waiting while this page is open.
+setInterval(() => fetch(location.pathname + "/video", { method: "HEAD" }).catch(() => {}), 5 * 60 * 1000);
+</script>
+</body>
+</html>

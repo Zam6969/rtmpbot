@@ -6,10 +6,11 @@ The bot runs everything:
 1. A DJ runs **`/register`** and gives a username, their timezone, and whether their videos should be
    **public** or **unlisted**. The bot privately replies with their personal RTMP key and where to paste it in VRCDN.
 2. The DJ streams. Several DJs can stream at the same time; each set is recorded with video and audio.
-3. When a set ends, the bot **DMs the DJ** with three buttons: **Custom title**, **Use default title**, or
-   **Cancel upload & delete VOD** (asks to confirm, then deletes the recording without uploading). If they don't
-   answer within 30 minutes, it uploads with the default title: **`@username on mm/dd/yyyy VRCHAT`**, dated in
-   the DJ's own timezone.
+3. When a set ends, the bot **DMs the DJ** with buttons: **Custom title**, **Use default title**,
+   **Cancel upload & delete VOD** (asks to confirm, then deletes the recording without uploading), and
+   **✂️ Trim video**, which opens a web page with a video player to cut the start and end (see below). If they
+   don't answer within 30 minutes, it uploads with the default title: **`@username on mm/dd/yyyy VRCHAT`**,
+   dated in the DJ's own timezone.
 4. The bot uploads the set to YouTube, **DMs the DJ the link**, and deletes the recording from the server.
 
 If a DJ's DMs are closed, the bot posts the title question and the link in the channel where they last used a bot command, mentioning them; only that DJ can press the buttons. `/register` sends a test DM and warns them if it can't reach them.
@@ -60,6 +61,18 @@ Then in Discord, run **`/youtube connect`**:
 3. Copy the address of the page that doesn't load (`http://localhost/...`) and paste it back into the bot.
 
 Run `/youtube connect` again at any time to switch channels. Use `/youtube connect new_client:True` to enter different Google credentials.
+
+## Trimming
+
+**✂️ Trim video** opens `https://<SITE_ADDRESS>/trim/<secret>` (a private, unguessable link for that one set).
+The page plays the recording, has start/end handles, ±5 s nudges, "set to current" buttons and a title box.
+**Save trim** keeps the choice for when the set uploads; **Save & upload** finishes right away. The title timer
+waits while the page is open. Cuts are made without re-encoding, so they land within a second or two.
+
+The page is served over HTTPS by Caddy (the `web` container), which gets a free certificate automatically.
+`SITE_ADDRESS` in `.env` is set by `deploy.sh`: the server's own hostname if public DNS points it at the server,
+otherwise `<ip-with-dashes>.sslip.io`. Ports **80** and **443** must be reachable. Only `/trim/...` is public;
+the bot's internal endpoints are not.
 
 ## Updates
 
