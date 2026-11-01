@@ -1008,6 +1008,60 @@ async def update(interaction: discord.Interaction):
     )
 
 
+def setup_instructions(guild_name: str, already_registered: bool) -> str:
+    mins = MIN_RECORDING_SECONDS // 60
+    return (
+        f"👋 Hi! You've been invited to stream DJ sets with the recorder bot in **{guild_name}**. "
+        "Your sets get recorded and posted to YouTube automatically.\n\n"
+        + ("**1. Sign up:** you're already signed up. Type `/settings` in the server to see your key again.\n"
+           if already_registered else
+           f"**1. Sign up:** in **{guild_name}**, type `/register` and choose:\n"
+           "   • **username**: the name your videos are titled with\n"
+           "   • **timezone**: start typing your city and pick it from the list\n"
+           "   • **privacy**: Public or Unlisted on YouTube\n")
+        + "**2. Add your key to VRCDN:** the bot privately replies with your **Custom RTMP key**. Go to "
+        "<https://panel.vrcdn.live/live.php>, find **Stream Forwarding**, pick **Custom RTMP** as the provider, "
+        "paste the key into the **Key** box and click **Add** (make sure it's enabled).\n"
+        f"**3. Stream like normal.** When your set ends (at least {mins} minutes), I'll message you to pick a title "
+        "or delete it, then send you the YouTube link.\n\n"
+        "Keep **Direct Messages** on for this server so I can reach you. "
+        "`/settings` changes your name, timezone or privacy; `/resetkey` makes a new key if yours leaks."
+    )
+
+
+@bot.tree.command(description="Admin: DM someone the instructions for streaming with the bot")
+@app_commands.describe(user="Who to send them to (pick them, or paste their user ID)")
+@app_commands.default_permissions(manage_guild=True)
+@owner_only()
+async def sendsetup(interaction: discord.Interaction, user: discord.User):
+    if user.bot:
+        await interaction.response.send_message("That's a bot account.", ephemeral=True)
+        return
+    guild_name = interaction.guild.name if interaction.guild else "the server"
+    text = setup_instructions(guild_name, store.dj_by_id(user.id) is not None)
+    try:
+        await user.send(text)
+        await interaction.response.send_message(f"✅ Sent the setup instructions to {user.mention} by DM.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        log.info("Couldn't DM setup instructions to %s: %s", user.id, e)
+    # Their DMs are closed (or they're not in a server with the bot): post here instead, mentioning them.
+    try:
+        await interaction.channel.send(
+            f"{user.mention} {text}", allowed_mentions=discord.AllowedMentions(users=[user]), suppress_embeds=True,
+        )
+        await interaction.response.send_message(
+            f"I couldn't DM {user.mention} (their DMs are closed), so I posted the instructions here and mentioned them.",
+            ephemeral=True,
+        )
+    except (discord.HTTPException, AttributeError):
+        await interaction.response.send_message(
+            f"I couldn't DM {user.mention} and couldn't post in this channel either. "
+            "Ask them to turn on DMs for this server, or run this in a channel I can post in.",
+            ephemeral=True,
+        )
+
+
 @bot.tree.command(description="Admin: post every uploaded set in a channel (leave empty to turn off)")
 @app_commands.describe(channel="Channel to post new VODs in. Leave empty to stop posting.")
 @app_commands.default_permissions(manage_guild=True)
