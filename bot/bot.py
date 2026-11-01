@@ -1045,7 +1045,7 @@ def setup_instructions(guild_name: str, already_registered: bool, inviter: str) 
         "paste the key into the **Key** box and click **Add** (make sure it's enabled). See the picture below.\n"
         f"**3. Stream like normal.** When your set ends (at least {mins} minutes), I'll message you to pick a title "
         "or delete it, then send you the YouTube link.\n\n"
-        f"Keep **Direct Messages** on for **{guild_name}** so I can reach you. "
+        "Keep **Direct Messages** on for our mutual servers so I can reach you. "
         "`/settings` changes your name, timezone or privacy; `/resetkey` makes a new key if yours leaks."
     )
 
