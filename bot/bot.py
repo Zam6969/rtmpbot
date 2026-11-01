@@ -636,14 +636,15 @@ class Bot(discord.Client):
         asyncio.create_task(housekeeping())
 
         if GUILD_ID:
+            # Admin commands live only in the server. The DJ commands stay global so they also work in the
+            # bot's DMs. Syncing both sets replaces whatever older versions registered.
             guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)  # replaces every old command in the server with the current set
-            # Remove commands an earlier version registered globally, which would show up as duplicates.
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-        else:
-            await self.tree.sync()
+            for cmd in list(self.tree.get_commands()):
+                if cmd.name not in DJ_COMMANDS:
+                    self.tree.remove_command(cmd.name)
+                    self.tree.add_command(cmd, guild=guild)
+            await self.tree.sync(guild=guild)
+        await self.tree.sync()
 
     async def on_ready(self):
         # Leftovers need the Discord connection (to DM DJs), so start them once we're logged in.
@@ -657,6 +658,13 @@ class Bot(discord.Client):
 
 
 bot = Bot()
+DJ_COMMANDS = {"register", "settings", "resetkey"}  # usable in the server and in DMs with the bot
+
+
+def remember_channel(interaction: discord.Interaction):
+    """Remember where to post for this DJ if their DMs are closed (only server channels are useful)."""
+    if interaction.guild_id:
+        store.set_channel(interaction.user.id, interaction.channel_id)
 
 
 def owner_only():
@@ -709,6 +717,7 @@ def settings_message(dj) -> str:
 
 
 @bot.tree.command(description="Sign up to stream and get your personal stream key")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
 @app_commands.describe(
     username="The name your videos are posted under",
     timezone="Your timezone (start typing your city, e.g. New_York, London, Tokyo)",
@@ -731,13 +740,13 @@ async def register(
     existing = store.dj_by_id(interaction.user.id)
     key = existing["stream_key"] if existing else new_key()
     store.save_dj(interaction.user.id, name, key, timezone, privacy.value)
-    store.set_channel(interaction.user.id, interaction.channel_id)
+    remember_channel(interaction)
     await interaction.response.send_message(
         ("You're all set!\n\n" if not existing else "Updated!\n\n") + settings_message(store.dj_by_id(interaction.user.id)),
         ephemeral=True,
     )
-    # Check now that DMs work, so DJs find out before their first set.
-    if await dm(interaction.user.id, "👋 You're signed up! This is where I'll ask you for titles and send your YouTube links.") is None:
+    # Check now that DMs work, so DJs find out before their first set (no need when they're already in DMs).
+    if interaction.guild_id and await dm(interaction.user.id, "👋 You're signed up! This is where I'll ask you for titles and send your YouTube links.") is None:
         await interaction.followup.send(
             "⚠️ I couldn't DM you. I'll post your title questions and YouTube links in this channel instead. "
             "To get them privately, turn on **Direct Messages** in this server's Privacy Settings.",
@@ -746,6 +755,7 @@ async def register(
 
 
 @bot.tree.command(description="See or change your username, timezone or video privacy")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
 @app_commands.describe(
     username="New username for your videos",
     timezone="New timezone",
@@ -775,11 +785,12 @@ async def settings(
         timezone or dj["timezone"],
         privacy.value if privacy else dj["privacy"],
     )
-    store.set_channel(interaction.user.id, interaction.channel_id)
+    remember_channel(interaction)
     await interaction.response.send_message(settings_message(store.dj_by_id(interaction.user.id)), ephemeral=True)
 
 
 @bot.tree.command(description="Get a new stream key (use this if your key leaked)")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
 async def resetkey(interaction: discord.Interaction):
     dj = store.dj_by_id(interaction.user.id)
     if dj is None:
@@ -789,7 +800,7 @@ async def resetkey(interaction: discord.Interaction):
         await interaction.response.send_message("You're live right now. Reset your key after you finish.", ephemeral=True)
         return
     store.save_dj(interaction.user.id, dj["name"], new_key(), dj["timezone"], dj["privacy"])
-    store.set_channel(interaction.user.id, interaction.channel_id)
+    remember_channel(interaction)
     await interaction.response.send_message(
         "New key made. The old one no longer works.\n\n" + settings_message(store.dj_by_id(interaction.user.id)),
         ephemeral=True,
@@ -1013,9 +1024,9 @@ def setup_instructions(guild_name: str, already_registered: bool) -> str:
     return (
         f"👋 Hi! You've been invited to stream DJ sets with the recorder bot in **{guild_name}**. "
         "Your sets get recorded and posted to YouTube automatically.\n\n"
-        + ("**1. Sign up:** you're already signed up. Type `/settings` in the server to see your key again.\n"
+        + ("**1. Sign up:** you're already signed up. Type `/settings` here to see your key again.\n"
            if already_registered else
-           f"**1. Sign up:** in **{guild_name}**, type `/register` and choose:\n"
+           "**1. Sign up:** type `/register` right here in this DM (or in the server) and choose:\n"
            "   • **username**: the name your videos are titled with\n"
            "   • **timezone**: start typing your city and pick it from the list\n"
            "   • **privacy**: Public or Unlisted on YouTube\n")
