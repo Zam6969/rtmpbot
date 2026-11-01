@@ -12,12 +12,19 @@ BRANCH=main
 LOG=config/update.log
 REQUEST=config/update-requested   # written by the bot; contains the Discord ID of the admin who asked
 RESULT=config/update-result       # read by the bot, which DMs it to that admin
+PROGRESS=config/update-progress   # current step, which the bot shows live while an admin's /update runs
 
 forced=0
 [ -f "$REQUEST" ] && forced=1
 if [ "$forced" = 0 ] && [ $(( 10#$(date +%M) % 15 )) -ne 0 ]; then
   exit 0
 fi
+
+progress() {  # progress <step>: only for /update; scheduled checks run silently
+  [ "$forced" = 1 ] || return 0
+  printf 'stage=%s\nold=%s\nnew=%s\ncount=%s\n' "$1" "${old:-}" "${new:-}" "${count:-}" > "$PROGRESS.tmp" \
+    && mv -f "$PROGRESS.tmp" "$PROGRESS"
+}
 
 finish() {  # finish <message>
   rm -f "$RESULT"
@@ -27,13 +34,15 @@ finish() {  # finish <message>
   echo "$(date -Is) $1" >> "$LOG"
 }
 
+old=$(git rev-parse --short HEAD 2>/dev/null || echo none)
+progress checking
 if ! git fetch -q origin "$BRANCH" 2>>"$LOG"; then
   [ "$forced" = 1 ] && finish "Couldn't reach GitHub to check for updates."
   exit 0
 fi
 
-old=$(git rev-parse --short HEAD 2>/dev/null || echo none)
 new=$(git rev-parse --short "origin/$BRANCH")
+count=$(git rev-list --count "HEAD..origin/$BRANCH" 2>/dev/null || echo "")
 if [ "$old" = "$new" ]; then
   [ "$forced" = 1 ] && finish "Already up to date (version $new)."
   exit 0
@@ -41,15 +50,18 @@ fi
 
 # The bot keeps config/busy fresh while someone is live or uploading. Ignore it if it's stale (bot crashed).
 if [ -n "$(find config/busy -mmin -10 2>/dev/null)" ]; then
+  progress waiting
   exit 0
 fi
+
+progress downloading
 
 changes=$(git log --format='• %s' "HEAD..origin/$BRANCH" 2>/dev/null | head -10)
 git reset -q --hard "origin/$BRANCH"
 chmod +x update.sh deploy.sh
 rm -f config/version && echo "$new" > config/version
 
-if ./deploy.sh >>"$LOG" 2>&1; then
+if PROGRESS_FILE="$PROGRESS" ./deploy.sh >>"$LOG" 2>&1; then
   finish "Updated $old → $new.
 $changes"
 else

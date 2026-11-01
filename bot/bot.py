@@ -50,6 +50,8 @@ CLIENT_PATH = CONFIG_DIR / "client_secret.json"
 BUSY_PATH = CONFIG_DIR / "busy"
 UPDATE_REQUEST_PATH = CONFIG_DIR / "update-requested"
 UPDATE_RESULT_PATH = CONFIG_DIR / "update-result"
+UPDATE_PROGRESS_PATH = CONFIG_DIR / "update-progress"
+UPDATE_MESSAGE_PATH = CONFIG_DIR / "update-message.json"  # which message shows /update's progress
 VERSION_PATH = CONFIG_DIR / "version"
 # Public HTTPS address (served by Caddy) for the trim pages; no trim button without it.
 SITE_ADDRESS = os.environ.get("SITE_ADDRESS", "").strip()
@@ -614,11 +616,74 @@ def refresh_busy():
         BUSY_PATH.unlink(missing_ok=True)
 
 
+UPDATE_STEPS = ["checking", "downloading", "installing", "restarting", "installed"]
+
+
+def read_update_progress() -> dict:
+    try:
+        return dict(line.split("=", 1) for line in UPDATE_PROGRESS_PATH.read_text().splitlines() if "=" in line)
+    except OSError:
+        return {}
+
+
+def render_update(progress: dict, result: str | None = None) -> str:
+    """The /update checklist. result is update.sh's final message, once there is one."""
+    stage, old, new, count = (progress.get(k) or "" for k in ("stage", "old", "new", "count"))
+    old = old or current_version()
+    if result and result.startswith("Already up to date"):
+        return f"🔄 **Updating Auto VOD**\n✅ Checked GitHub: already up to date (version `{old}`)"
+    if result and result.startswith("Couldn't reach GitHub"):
+        return f"🔄 **Updating Auto VOD**\n❌ Couldn't reach GitHub. Try again in a few minutes. (version `{old}`)"
+
+    succeeded = bool(result) and result.startswith("Updated")
+    if succeeded:
+        new = new or result.split("→")[-1].split()[0].rstrip(".")
+    labels = {
+        "checking": f"Checking GitHub (current version `{old}`)",
+        "downloading": f"Downloading {count + ' ' if count else ''}change{'' if count == '1' else 's'}"
+                       + (f": `{old}` → `{new}`" if new else ""),
+        "installing": "Installing",
+        "restarting": "Restarting bot",
+        "installed": f"Installed version `{new}`" if new else "Installed",
+    }
+    current = UPDATE_STEPS.index(stage) if stage in UPDATE_STEPS else (1 if stage == "waiting" else 0)
+    lines = ["🔄 **Updating Auto VOD**"]
+    for i, step in enumerate(UPDATE_STEPS):
+        if succeeded or i < current:
+            mark = "✅"
+        elif i == current:
+            mark = "❌" if result else ("⏸️" if stage == "waiting" else "⏳")
+        else:
+            mark = "▫️"
+        text = labels[step]
+        if i == current and stage == "waiting" and not result:
+            text = "Waiting: someone is live or uploading. I'll continue when they're done."
+        lines.append(f"{mark} {text}{'…' if mark == '⏳' else ''}")
+    if result and not succeeded:
+        lines.append(f"\n{result}")
+    elif succeeded:
+        changes = [line for line in result.splitlines() if line.startswith("•")]
+        if changes:
+            lines.append("\n**What's new**\n" + "\n".join(changes))
+    return "\n".join(lines)
+
+
+def update_message():
+    """The message showing /update's progress, if one was posted."""
+    try:
+        ids = json.loads(UPDATE_MESSAGE_PATH.read_text())
+        return bot.get_partial_messageable(ids["channel_id"]).get_partial_message(ids["message_id"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 async def housekeeping():
-    """Keep the busy marker fresh and pass update results from update.sh on to the admin who asked."""
+    """Keep the busy marker fresh, and show update.sh's progress and result to the admin who ran /update."""
     await bot.wait_until_ready()
+    shown = None
     while True:
         refresh_busy()
+        target = update_message()
         if UPDATE_RESULT_PATH.exists():
             lines = UPDATE_RESULT_PATH.read_text().splitlines()
             UPDATE_RESULT_PATH.unlink(missing_ok=True)
@@ -627,9 +692,28 @@ async def housekeeping():
             requester = m[1] or ""
             message = "\n".join([m[2]] + lines[1:]).strip()
             log.info("Update: %s", message)
-            if requester.isdigit():
-                await dm(int(requester), f"🔄 {message}")
-        await asyncio.sleep(30)
+            text = render_update(read_update_progress(), message)
+            UPDATE_PROGRESS_PATH.unlink(missing_ok=True)
+            UPDATE_MESSAGE_PATH.unlink(missing_ok=True)
+            shown = None
+            edited = False
+            if target is not None:
+                try:
+                    await target.edit(content=text)
+                    edited = True
+                except discord.HTTPException as e:
+                    log.warning("Couldn't edit the /update progress message: %s", e)
+            if not edited and requester.isdigit():
+                await dm(int(requester), text)
+        elif target is not None and UPDATE_PROGRESS_PATH.exists():
+            text = render_update(read_update_progress())
+            if text != shown:
+                shown = text
+                try:
+                    await target.edit(content=text)
+                except discord.HTTPException as e:
+                    log.warning("Couldn't update the /update progress message: %s", e)
+        await asyncio.sleep(2)
 
 
 def current_version() -> str:
@@ -1194,14 +1278,18 @@ async def uploads(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_guild=True)
 @owner_only()
 async def update(interaction: discord.Interaction):
+    UPDATE_PROGRESS_PATH.unlink(missing_ok=True)
     UPDATE_REQUEST_PATH.write_text(f"{interaction.user.id}\n")
-    busy = " Someone is live or uploading right now, so it will wait until they're done." if (
-        live_keys or uploading) else ""
-    await interaction.response.send_message(
-        f"Checking GitHub for updates (current version: `{current_version()}`). "
-        f"This takes up to a minute, plus a few minutes if there's something to install.{busy} "
-        "I'll DM you the result.", ephemeral=True,
-    )
+    text = render_update({"stage": "checking", "old": current_version()})
+    if interaction.guild is None:
+        # In DMs the reply itself becomes the live checklist.
+        await interaction.response.send_message(text)
+        msg = await interaction.original_response()
+    else:
+        await interaction.response.send_message("Update started. I'm showing the progress in your DMs.", ephemeral=True)
+        msg = await dm(interaction.user.id, text)
+    if msg is not None:
+        UPDATE_MESSAGE_PATH.write_text(json.dumps({"channel_id": msg.channel.id, "message_id": msg.id}))
 
 
 SETUP_IMAGE = Path(__file__).parent / "assets" / "vrcdn-custom-rtmp.png"

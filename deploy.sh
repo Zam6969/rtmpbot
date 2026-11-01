@@ -4,6 +4,10 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+step() {  # step <name>: tell the bot's /update progress message which step we're on (update.sh sets PROGRESS_FILE)
+  if [ -n "${PROGRESS_FILE:-}" ] && [ -f "$PROGRESS_FILE" ]; then sed -i "s/^stage=.*/stage=$1/" "$PROGRESS_FILE"; fi
+}
+
 # Public web address for the trim page. Use the server's own hostname if public DNS points it at this
 # server; otherwise a free <ip>.sslip.io name, which always resolves to the IP inside it.
 if [ -f .env ] && ! grep -q '^SITE_ADDRESS=' .env; then
@@ -32,4 +36,7 @@ if command -v ufw >/dev/null && sudo -n ufw status 2>/dev/null | grep -q "Status
 fi
 
 if docker info >/dev/null 2>&1; then docker=(docker); else docker=(sudo docker); fi
-"${docker[@]}" compose up -d --build --remove-orphans
+step installing
+"${docker[@]}" compose build || exit 1
+step restarting
+"${docker[@]}" compose up -d --remove-orphans
