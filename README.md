@@ -19,7 +19,7 @@ If a DJ's DMs are closed, the bot posts the title question and the link in the c
 
 | Command | Who | What it does |
 |---|---|---|
-| `/register username timezone privacy` | anyone | Signs you up and gives you your RTMP key. Run it again to change your answers. |
+| `/register username timezone privacy` | anyone | Signs you up and gives you your RTMP key. Works once per Discord account; use `/settings` afterwards. |
 | `/settings [username] [timezone] [privacy]` | DJs | Shows your settings and key, or changes any of them. |
 | `/resetkey` | DJs | Makes a new key. The old one stops working. |
 | `/youtube connect` | admins | Links the YouTube channel that sets upload to (see below). |

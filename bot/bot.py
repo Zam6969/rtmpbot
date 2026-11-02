@@ -1006,12 +1006,18 @@ async def register(
         await interaction.response.send_message("Please give a username.", ephemeral=True)
         return
     existing = store.dj_by_id(interaction.user.id)
-    key = existing["stream_key"] if existing else new_key()
-    store.save_dj(interaction.user.id, name, key, timezone, privacy.value)
+    if existing:
+        # One sign-up per Discord account; changes go through /settings so the key and history stay put.
+        await interaction.response.send_message(
+            f"You're already signed up as **@{existing['name']}**. Use `/settings` to change your username, "
+            "timezone or privacy, or to see your key again.",
+            ephemeral=True,
+        )
+        return
+    store.save_dj(interaction.user.id, name, new_key(), timezone, privacy.value)
     remember_channel(interaction)
     await interaction.response.send_message(
-        ("You're all set!\n\n" if not existing else "Updated!\n\n") + settings_message(store.dj_by_id(interaction.user.id)),
-        ephemeral=True,
+        "You're all set!\n\n" + settings_message(store.dj_by_id(interaction.user.id)), ephemeral=True,
     )
     # Check now that DMs work, so DJs find out before their first set (no need when they're already in DMs).
     if interaction.guild_id and await dm(interaction.user.id, "👋 You're signed up! This is where I'll ask you for titles and send your YouTube links.") is None:
